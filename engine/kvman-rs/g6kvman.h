@@ -91,15 +91,28 @@ void g6kv_stores(g6kv_pool* p, uint32_t shared_after);
 // restarts while `compat` stays the same. 0, or -1 with g6kv_tier_error.
 int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
 // at admission, before the grant, on every rank: counts the prompt toward its prefixes and returns how many
-uint32_t g6kv_count(g6kv_pool* p, const int32_t* prompt, size_t n);
+// span: the prompt's system span in tokens (the system message and tool definitions as templated), or -1 when the
+// front end sent none
+uint32_t g6kv_count(g6kv_pool* p, const int32_t* prompt, size_t n, int64_t span);
+// tier t's policy (after g6kv_add_tier): evicted runs need min_rows rows and min_hits continuations to be stored there.
+// block_bytes: what one block takes, for the counters
+int g6kv_tier_policy(g6kv_pool* p, uint32_t t, uint64_t min_rows, uint32_t min_hits, uint64_t block_bytes);
+// the write limit: all tiers write at most milli / 1000 blocks per page of KV computed (0 = none)
+void g6kv_write_limit(g6kv_pool* p, uint64_t milli);
 // one copy: kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's slot -> page).
-// An earlier copy of the list can write the block a later one reads: an engine that runs copies together keeps that
-// order.
+// part 0: the whole page block of pool page `page`. Past R (g6kv_tail): 1 = this rank's shard of the attention caches at
+// physical page `page`; 2 = logical page `page`'s replicated parts (indexer keys, unsharded bindings), the sub-th of the
+// block's per_slot. An earlier copy of the list can write the block a later one reads: an engine that runs copies
+// together keeps that order.
 struct g6kv_io
 {
     uint32_t kind, page, tier, to;
     uint64_t slot, to_slot;
+    uint32_t part, sub;
 };
+// runs past R keep their tails: nr ranks share the attention caches past R, a block holds per_slot logical pages'
+// replicated parts. After g6kv_stores
+void g6kv_tail(g6kv_pool* p, uint32_t nr, uint32_t per_slot);
 size_t g6kv_io_pending(const g6kv_pool* p);
 // takes every queued copy into out. out holds cap entries, at least g6kv_io_pending.
 int g6kv_io_take(g6kv_pool* p, g6kv_io* out, size_t cap);
@@ -110,7 +123,13 @@ struct g6kv_tier_totals
 {
     uint64_t slots, free_slots;
     uint32_t entries, shared;
-    uint64_t spilled_pages, moved_in_pages, restored_pages, hits, dropped;
+    uint64_t spilled_pages, moved_in_pages, restored_pages, hits;
+    uint64_t dropped, dropped_pages;     // entries that left with no tier to go to
+    uint64_t moved_out, moved_out_pages; // entries passed on to the next tier
+    uint64_t refused, refused_pages;     // entries the policy or the write limit refused
+    uint64_t full;                       // times the tier had to make room
+    uint64_t block_bytes;
+    int64_t credit;                      // write limit credit left, blocks (0 without a limit)
 };
 // tier t's counters, or an error when there is no such tier
 int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);

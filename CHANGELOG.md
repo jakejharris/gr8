@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-12: what the KV stores keep (`--kv-store`, `--kv-keep`), system prompts by default
+
+- Experimental, off by default. `--kv-store STORE,size=N` (repeatable, tried in order; `KV_STORE`, stores separated by `;`) says where, and
+  `--kv-keep system|sessions|all` (`KV_KEEP`) what. `system`, the default: each system prompt with its tools, once,
+  after `--kv-system-after` conversations (default 2) started with it. `sessions`: those, plus runs the pool evicts that
+  continued their conversation at least once. `all`: every eviction (#37's `keep=evicted`). `--kv-tier` and
+  `--kv-shared-after` remain one release as deprecated aliases: a tier that kept evicted runs maps to `all`.
+- Testers ran `keep=evicted` on live agent traffic: ~30,400 pages a rank in 37 minutes, nothing restored, ~2 TB a day.
+  kvman-sim on the opencode captures agrees (109 GB/h a rank for four agents that fit the pool, one restore); `system`
+  writes under 4 GB/h. `sessions` and `all` pay off only with more agents than the KV pool holds.
+- A turn that continues a conversation whose last run the pool let go unstored counts toward no prefix (the pool
+  remembers the heads of the last 1,024 runs it let go), and counts as continued for `sessions`.
+  `engine/kvman-rs/REMOTE-TIER.md` has the numbers. `system` is the recommended setting; `sessions` for agent fleets
+  larger than the KV pool.
+- The front ends send each chat request's system span (`system_tokens`, PROTOCOL.md): the system messages and tools as
+  templated. A new conversation counts only the prefix cells inside it, so an agent's own history never passes for a
+  system prompt.
+- An SSD store starts empty at every boot: blocks, index and counts. `persist=on` keeps it across restarts, keyed on
+  the model, layout, block format (`KV_BLOCK_FORMAT`) and a hash of the engine binary; another key clears it with a log
+  line. A boot that served wrong output must not hand its blocks or counts to the next (REMOTE-TIER.md, Persistence).
+- A run's prefix that another run in the pool holds is stored once and referenced; a restore takes it from a retained
+  run in the pool when one has it.
+- A run past `SHARE_LIMIT` keeps its tail under `sessions` and `all`: each rank stores its own shard and the
+  replicated parts, and a hit restores the rows past R instead of prefilling them again (checked in m4sim; not yet on
+  the cluster).
+- `--kv-write-limit F` (`KV_WRITE_LIMIT`): at most F blocks written per page of KV computed. Deterministic, off by
+  default.
+- Rank 0 logs, at most once a minute, what a store did once it fills, passes entries on, drops or refuses them.
+  `status.s2` has per-store bytes and pages spilled, moved, restored, dropped and refused, exported as
+  `g6:kv_store_*{store="i"}`. The shim now sends the engine status under `scheduler`, so the `g6:s2_*` metrics, never
+  exported before, are too.
+
 ## 2026-10-12: thinking controls and a `response_format` guard in the front end
 
 - GLM 5.3's chat template cannot turn thinking off, and the front end passed `enable_thinking` to it, which it never
