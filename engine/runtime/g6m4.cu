@@ -33,6 +33,12 @@
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
+//      [--kv-tier STORE,size=N(G|T)[,keep=evicted|shared|all]]...  under S2 with --reuse-prefix: block stores below the
+//                     pool, tried in flag order (s2/kv_tier.cuh, kvman-rs src/stash.rs). keep=evicted: retained runs the
+//                     pool evicts. shared: prefixes that started --kv-shared-after N conversations (default 3), written
+//                     once. all: both. A request that continues a stored entry reads its pages back and skips their prefill.
+//                     STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id its shared prefixes survive
+//                     restarts) or remote:HOST:PORT (a lease on a KV node, ./gr8 kv up; RDMA where both ends can, else TCP)
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
 //      [--serve DIR --s2-port N [--s2-sessions S] [--s2-epoch E]]  serve requests through S2 (a G6_CP build); --prompt is
@@ -75,6 +81,9 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/pool.h"
+#include "s2/kv_tier.cuh"
+#include <filesystem>
+#include <unistd.h>
 
 using namespace g6rt;
 
@@ -120,6 +129,8 @@ int main(int argc, char** argv)
     int pfrows = 0, mtp = 0, lanes = 1;
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
     std::string s2dir;                  // --serve DIR: serve through S2 (below R)
+    std::vector<std::string> kv_tiers;  // --kv-tier, in flag order
+    int kv_shared_after = 3;            // --kv-shared-after
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     int s2port = 0, s2sess = 8;
     unsigned long long s2epoch = 1;
@@ -166,6 +177,8 @@ int main(int argc, char** argv)
         else if (a == "--image") image = true;
         else if (a == "--no-hash") hash = false;
         else if (a == "--reuse-prefix") reuse_prefix = true;
+        else if (a == "--kv-tier") kv_tiers.push_back(next());
+        else if (a == "--kv-shared-after") kv_shared_after = atoi(next().c_str());
         else if (a == "--prefill") MP = atoi(next().c_str());
         else if (a == "--top") top = atoi(next().c_str());
         else if (a == "--wide") wide = true;
@@ -233,6 +246,7 @@ int main(int argc, char** argv)
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
+    if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-tier needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
     if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
@@ -692,6 +706,7 @@ int main(int argc, char** argv)
         sc.two_lanes = two;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+        int reuse_grid = 0;
         // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
         // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
         if (reuse_prefix)
@@ -704,9 +719,92 @@ int main(int argc, char** argv)
             PrefixReuse rules;
             rules.strict = st_ == 1; rules.noend = ne_ == 1; rules.grid = al_ == 1 ? MP : 0;
             pool.keep(rules);
+            reuse_grid = rules.grid;
             if (env_choice("G6_POOL_LOG", 1, 0, &err) == 1) pool.log(true);   // one stderr line per pool claim: first page, pages, evicted retained runs
             if (R == 0) fprintf(stderr, "# s2 reuse on: retired runs kept until a claim overlaps them; grid %d rows\n", rules.grid);
         }
+        // --kv-tier: block stores below the pool, in flag order, the same number of blocks on every rank. An SSD tier lives in
+        // PATH/r<rank>; its shared prefixes survive restarts (their index needs --set-id: the blocks belong to one model)
+        std::unique_ptr<g6s2::KvTiers> kvt;
+        bool kv_index = false, kv_count = false;
+        if (!kv_tiers.empty())
+        {
+            std::vector<const G6AttnBinding*> bs;
+            for (Model* x : {&m, &D.d}) for (G6AttnBinding* b : x->s2->pool) bs.push_back(b);
+            size_t nidx = 0;
+            for (const G6AttnBinding* b : bs) nidx += b->args.index_cache != nullptr;
+            char host[64] = "host";
+            gethostname(host, sizeof host - 1);
+            const std::string name = std::string("g6m4-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R);
+            try
+            {
+                kvt.reset(new g6s2::KvTiers(bs));
+                pool.stores((uint32_t)std::max(1, kv_shared_after));
+                for (size_t i = 0; i < kv_tiers.size(); ++i)
+                {
+                    const g6s2::TierSpec t = g6s2::TierSpec::parse(kv_tiers[i]);
+                    std::string spec = t.store, index;
+                    if (t.ssd())
+                    {
+                        const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
+                        std::filesystem::create_directories(dir);
+                        spec = "ssd:" + dir + "/blocks";
+                        if (t.keep != 0 && !set_id.empty()) index = dir;
+                    }
+                    const uint64_t slots = kvt->add(spec, name + "-t" + std::to_string(i), t.bytes);
+                    const std::string compat = "set " + set_id + " nr " + std::to_string(g6nr::NR) + " below " + std::to_string(s2_below) +
+                        " place " + std::to_string(place) + " grid " + std::to_string(reuse_grid) + " block " +
+                        std::to_string(kvt->blocks().slot_bytes()) + " bindings " + std::to_string(bs.size()) + "/" +
+                        std::to_string(nidx) + " slots " + std::to_string(slots);
+                    pool.add_tier(slots, t.keep, index, compat);
+                    kv_index = kv_index || !index.empty();
+                    kv_count = kv_count || t.keep != 0;
+                    fprintf(stderr, "# rank %d: s2 tier %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
+                            (unsigned long long)slots, kvt->blocks().slot_bytes(), t.keep == 0 ? "evicted" : t.keep == 1 ? "shared" : "all",
+                            index.empty() ? "" : ", indexed");
+                }
+            }
+            catch (const std::exception& e) { die(std::string("--kv-tier: ") + e.what()); }
+            if (R == 0 && kv_count) fprintf(stderr, "# s2 tiers: a prefix is shared after %d conversations\n", std::max(1, kv_shared_after));
+        }
+        // the copies the pool queued: run them before anything writes those pages, then commit what they wrote
+        // Every rank prints its drain with the wall clock (ms since the Unix epoch): the drain runs after the event fence
+        // and before the next quantum's fabric waits (G6_SPIN_TIMEOUT_CYC, ~10 s), so the skew between ranks' drains is
+        // the number that matters, and only the lines of every rank show it.
+        std::atomic<bool> kv_drained{false};   // the head drains a cancelled run on its control thread
+        // G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>], TEST ONLY: that rank sleeps <ms> inside every <every>th tier drain that
+        // copies anything (default every one), as a drain stalled on its store would. Reproduces the rank skew the
+        // barrier after a drain (NativeHooks::drained) has to absorb.
+        int kv_delay_rank = -1, kv_delay_ms = 0, kv_delay_every = 1;
+        long kv_delay_n = 0;
+        if (const char* e = getenv("G6_KV_DRAIN_DELAY"))
+            if (sscanf(e, "%d:%d:%d", &kv_delay_rank, &kv_delay_ms, &kv_delay_every) < 2 || kv_delay_ms < 0 || kv_delay_every < 1)
+                die("G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]");
+        auto kv_drain = [&] {
+            if (!kvt) return;
+            const auto io = pool.io();
+            kvt->run(io, st);
+            if (!io.empty())
+            {
+                kv_drained = true;
+                if (R == kv_delay_rank && ++kv_delay_n % kv_delay_every == 0)
+                {
+                    fprintf(stderr, "# rank %d: G6_KV_DRAIN_DELAY: sleeping %d ms in tier drain %ld at %lld ms\n", R, kv_delay_ms, kv_delay_n,
+                            (long long)g6s2::s2_wall_ms());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(kv_delay_ms));
+                }
+                size_t n[3] = {0, 0, 0};
+                for (const auto& x : io) ++n[x.kind];
+                fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s\n", R,
+                        n[0], n[1], n[2], kvt->last_ms, kvt->last_device_ms, (long long)g6s2::s2_wall_ms(), kvt->last_ms > 2000 ? " SLOW" : "");
+            }
+            if (const char* e = pool.io_done()) fprintf(stderr, "# rank %d: s2 tier index: %s\n", R, e);
+        };
+        // G6_S2_BIND_DELAY=<rank>:<ms>: that rank sleeps after its bind (after the drain), as a drain that slow would. Shows
+        // what a bind skew does to the next quantum on the other ranks (nothing else changes), with or without tiers.
+        int bind_delay_rank = -1, bind_delay_ms = 0;
+        if (const char* e = getenv("G6_S2_BIND_DELAY"))
+            if (sscanf(e, "%d:%d", &bind_delay_rank, &bind_delay_ms) != 2 || bind_delay_ms < 0) die("G6_S2_BIND_DELAY=<rank>:<ms>");
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
         G6RT_CK(cudaStreamSynchronize(st));
         // DFlash2: Dfl::pf_feat holds one request's prefill taps, the last WIN prompt positions of the session whose
@@ -743,8 +841,9 @@ int main(int argc, char** argv)
                 {
                     const int ctx = (int)(sl.req.prompt_tokens + sl.req.max_tokens);
                     const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx, (int)sl.req.prompt_tokens);
-                    fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d)\n", R,
-                            (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
+                    fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d) first %u at %lld ms\n", R,
+                            (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx,
+                            (unsigned)sl.prefilled, (long long)g6s2::s2_wall_ms());
                 }
                 if (dfl && DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: as the offline loop per sequence
                 {
@@ -756,7 +855,11 @@ int main(int argc, char** argv)
             },
             [&]() { m.s2_pf_table = D.d.s2_pf_table = false; },
             [&]() { cp_pf_in(); }, [&]() { cp_pf_out(); },
-            [&]() -> unsigned { return cp_error() | cp_pf_err(); }};
+            [&]() -> unsigned {   // cp: the CP decode fabric; cp_pf|qp: the CP prefill staging fabric (0x63..), else the QO pair wire (0x65..)
+                const unsigned c = cp_error(), p = cp_pf_err();
+                if (c || p) fprintf(stderr, "# rank %d: S2 extra error words: cp %08x cp_pf|qp %08x\n", R, c, p);
+                return c | p;
+            }};
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -782,7 +885,21 @@ int main(int argc, char** argv)
                 h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit) { return pool.match(p, rows, worst, limit); };
                 h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst) { return pool.take(x, rows, worst); };
             }
+            if (kvt)
+            {
+                h.pool.tiers = [&] { return pool.tiers(); };
+                if (kv_count) h.pool.count = [&](const std::vector<int>& p) { return pool.count(p); };
+                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s) { pool.retain(r, s); kv_drain(); };   // a promoted prefix
+            }
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
+                // the store copies the grant queued: evicted runs out before anything writes their pages, a stored run in
+                kv_drain();
+                if (R == bind_delay_rank && bind_delay_ms)
+                {
+                    fprintf(stderr, "# rank %d: G6_S2_BIND_DELAY: sleeping %d ms after the bind of request %llu at %lld ms\n", R, bind_delay_ms,
+                            (unsigned long long)g.req.id, (long long)g6s2::s2_wall_ms());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
+                }
                 const int q = (int)g.key.slot;
                 slot_prompt[q] = g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
@@ -810,6 +927,7 @@ int main(int argc, char** argv)
             // a run grew between rounds (every rank, same order): the new pages, cleared as a new run's are, into slot q's
             // table, and into the layers' own tables when q runs alone on today's path
             h.grown = [&](unsigned q, const g6s2::Run& r) {
+                kv_drain();   // runs the growth evicted, out before the zeroing below
                 const std::vector<int> list = pool.list(r);
                 for (Model* x : {&m, &D.d})
                 {
@@ -823,6 +941,7 @@ int main(int argc, char** argv)
             };
             h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
             h.fence = [&] { nd.synchronize(); };
+            if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
             h.dispatch = nd.hooks();
             if (dfl)
             {
@@ -893,6 +1012,13 @@ int main(int argc, char** argv)
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+            if (kv_index)   // every rank keeps the stored prefixes all of them loaded, in the head's order
+            {
+                pool.keep_agreed(g6s2::agree_lines(bc, links, pool.stored_summary()));
+                size_t n = 0;
+                for (const auto& t : pool.tiers()) n += t.entries;
+                fprintf(stderr, "# rank %d: s2 tiers: %zu stored prefixes from earlier runs\n", R, n);
+            }
             // every reachable S2 graph key, captured after the bootstrap (its timeout does not cover the capture) and before
             // the head publishes ready.s2 (Service::run): the all-rank barrier, with no receive timeout, replaces the skew limit
             // the batched graphs carry no DFlash2 taps (their rows outnumber Dfl::feat's 8); the solo graphs keep them
