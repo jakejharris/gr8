@@ -1,7 +1,7 @@
 //! The C entry points (g6kvman.h). Each returns 0 or an error code that g6kv_error names, and an error leaves the pool
 //! unchanged. Release builds abort on a panic, so none unwinds into C++.
 
-use crate::pool::{Error, Pool, Run, Stats};
+use crate::pool::{Error, Namespace, Pool, Run, Stats, NAMESPACE_BYTES};
 use crate::reuse::{Finished, Rules};
 use crate::stash::{Io, Keep, Part, Policy, TierStats};
 use std::ffi::c_char;
@@ -190,12 +190,15 @@ pub unsafe extern "C" fn g6kv_retain(
     valid: i32,
     written_end: i32,
     pf_end: i32,
+    namespace: *const u8,
 ) -> i32 {
     let Some(history) = slice(history, n) else { return Error::BadArgument.code() };
+    let Some(namespace) = slice(namespace, NAMESPACE_BYTES) else { return Error::BadArgument.code() };
     if r.is_null() {
         return Error::BadArgument.code();
     }
-    code((*p).retain(&*r, Finished { history: history.to_vec(), valid, written_end, pf_end }))
+    let namespace: Namespace = namespace.try_into().expect("fixed namespace length");
+    code((*p).retain_namespaced(&*r, Finished { history: history.to_vec(), valid, written_end, pf_end }, namespace))
 }
 
 /// # Safety
@@ -208,13 +211,16 @@ pub unsafe extern "C" fn g6kv_match(
     rows: u64,
     worst: u64,
     limit: i32,
+    namespace: *const u8,
     out: *mut G6kvHit,
 ) -> i32 {
     let Some(prompt) = slice(prompt, n) else { return Error::BadArgument.code() };
+    let Some(namespace) = slice(namespace, NAMESPACE_BYTES) else { return Error::BadArgument.code() };
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    let h = (*p).match_prefix(prompt, rows, worst, limit);
+    let namespace: Namespace = namespace.try_into().expect("fixed namespace length");
+    let h = (*p).match_prefix_namespaced(prompt, rows, worst, limit, namespace);
     *out = G6kvHit {
         skip: h.skip,
         lcp: h.lcp,

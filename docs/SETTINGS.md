@@ -39,6 +39,11 @@ the short version.
 | `--chunk 8` | 8 | `Plan::chunk` of the step plan (`rank.cuh`); 8 is what we serve with |
 | `--temp 0.7` / `--top-p-cands 256` | | engine default temperature (each request carries its own through the shim) / top-p candidates per rank per row (256 = served) |
 | `--no-hash` | off (`NOHASH=1`) | skip the sha256 check of every pack tensor at load |
+| `--steering-profile DIR` | off (`STEERING_PROFILE`) | load and validate one schema-v1 rank-one profile before readiness; directions stay resident on device. See [STEERING.md](STEERING.md) |
+| `--steering-force SCALE` | off (`STEERING_FORCE`) | process-wide qualification mode, finite in `(0, 4]`; otherwise the loaded profile is selected per request |
+| `--steering-model-revision REV` / `--steering-tokenizer-revision REV` | required with a profile | exact identities the loader compares with the profile manifest |
+| `--steering-weight-set SHA256` | `--set-id` | stable underlying weight-set identity; HF release auto-discovery fills this when repository identity differs |
+| `--steering-chat-template-sha256 HEX` | required with a profile | lowercase SHA-256 of the served chat template |
 
 ## Engine environment
 

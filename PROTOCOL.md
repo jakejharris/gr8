@@ -178,3 +178,4 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
   passes it on as `sys <n>` in the request header.
 - v1 (2026-10-12): `generate` `insert` and hello `insert`. An engine without them leaves the hello key out, and the
   front end then sends no `insert`, so the version stays 1.
+- v1, steering (2026-10-11): optional `hello.steering` capability and `generate` steering vendor fields.

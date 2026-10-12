@@ -536,18 +536,84 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
     }
     red[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
     __syncthreads();
-    if (warp) return;
-    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
-    #pragma unroll
-    for (int q = 0; q < NW; ++q)
+    const float scale = A.steer_scale ? A.steer_scale[m] : 0.f;
+    const bool steer = A.steer_dir && scale != 0.f && A.steer_alpha != 0.f;
+    __shared__ int steer_last;
+    __shared__ float steer_kappa;
+    if (warp == 0)
     {
-        const float4 v = red[q][lane];
-        acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
+        acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+        #pragma unroll
+        for (int q = 0; q < NW; ++q)
+        {
+            const float4 v = red[q][lane];
+            acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
+        }
+        const uint2 yr = SH ? make_uint2(0u, 0u) : *reinterpret_cast<const uint2*>(A.ypart + (static_cast<size_t>(A.ysh) + m) * HID + n0);
+        const float2 y01 = __half22float2(as_h2(yr.x)), y23 = __half22float2(as_h2(yr.y));
+        const float4 shared = SH ? red[NW - 1][lane] : make_float4(y01.x, y01.y, y23.x, y23.y);
+        uint2 o;
+        o.x = pack_o2(acc[0] + y01.x, acc[1] + y01.y, A.out_bf16);
+        o.y = pack_o2(acc[2] + y23.x, acc[3] + y23.y, A.out_bf16);
+        *reinterpret_cast<uint2*>(K1_OUT(A) + m * HID + n0) = o;
+
+        // Project only the shared expert contribution. The routed sum in `o` never participates in the dot. One fixed
+        // partial per 128-column CTA avoids nondeterministic floating-point atomics; whichever CTA arrives last sums
+        // the 48 partials in column order. All five resident warps then share the correction instead of serializing it
+        // through warp 0; the existing finalize launch and slot publish remain unchanged.
+        if (steer)
+        {
+            const float4 r = *reinterpret_cast<const float4*>(A.steer_dir + n0);
+            float dot = shared.x * r.x + shared.y * r.y + shared.z * r.z + shared.w * r.w;
+            #pragma unroll
+            for (int d = 16; d > 0; d >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, d);
+            if (lane == 0)
+            {
+                const int b = blockIdx.x % 48;
+                A.steer_part[(size_t)m * 48 + b] = dot;
+                __threadfence();
+                steer_last = atomicAdd(A.steer_count + m, 1u) == 47u;
+                if (steer_last)
+                {
+                    float total = 0.f;
+                    #pragma unroll
+                    for (int j = 0; j < 48; ++j) total += A.steer_part[(size_t)m * 48 + j];
+                    steer_kappa = (scale * A.steer_alpha) * total;
+                }
+            }
+        }
     }
-    const uint2 yr = SH ? make_uint2(0u, 0u) : *reinterpret_cast<const uint2*>(A.ypart + (static_cast<size_t>(A.ysh) + m) * HID + n0);
-    const float2 y01 = __half22float2(as_h2(yr.x)), y23 = __half22float2(as_h2(yr.y));
-    uint2 o;
-    o.x = pack_o2(acc[0] + y01.x, acc[1] + y01.y, A.out_bf16);
-    o.y = pack_o2(acc[2] + y23.x, acc[3] + y23.y, A.out_bf16);
-    *reinterpret_cast<uint2*>(K1_OUT(A) + m * HID + n0) = o;
+    if (!steer) return;
+    __syncthreads();
+    if (steer_last)
+    {
+        const float kappa = steer_kappa;
+        for (int c = threadIdx.x * 4; c < HID; c += blockDim.x * 4)
+        {
+            const float4 d = *reinterpret_cast<const float4*>(A.steer_dir + c);
+            if (A.out_bf16)
+            {
+                __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(K1_OUT(A) + (size_t)m * HID + c);
+                const uint2 q = *reinterpret_cast<const uint2*>(dst);
+                const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&q);
+                *reinterpret_cast<uint2*>(dst) = make_uint2(pack_bf2(__bfloat162float(b[0]) - kappa * d.x,
+                                                                     __bfloat162float(b[1]) - kappa * d.y),
+                                                            pack_bf2(__bfloat162float(b[2]) - kappa * d.z,
+                                                                     __bfloat162float(b[3]) - kappa * d.w));
+            }
+            else
+            {
+                __half* dst = K1_OUT(A) + (size_t)m * HID + c;
+                const uint2 q = *reinterpret_cast<const uint2*>(dst);
+                const float2 x01 = __half22float2(as_h2(q.x)), x23 = __half22float2(as_h2(q.y));
+                *reinterpret_cast<uint2*>(dst) = make_uint2(pack_h2(x01.x - kappa * d.x, x01.y - kappa * d.y),
+                                                           pack_h2(x23.x - kappa * d.z, x23.y - kappa * d.w));
+            }
+        }
+        // This block barrier makes every correction write visible to warp 0. dslot::publish immediately follows the
+        // body and performs the existing system-scope fence/release before ringing the NIC doorbell; CUDA's cumulative
+        // system ordering carries the writes made visible here. With no slot, kernel completion provides the boundary.
+        __syncthreads();
+        if (threadIdx.x == 0) A.steer_count[m] = 0u;
+    }
 }

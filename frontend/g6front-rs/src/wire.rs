@@ -172,6 +172,8 @@ pub struct GenParams {
     pub system_tokens: Option<u64>,
     /// the engine's insert rule (PROTOCOL.md `insert`); only sent when set
     pub insert: Option<InsertRule>,
+    pub steering_profile: Option<String>,
+    pub steering_scale: Option<f64>,
 }
 
 /// Once the reply holds `after_tokens` tokens and none of them is `unless_emitted`, the engine puts `tokens` in place of
@@ -245,6 +247,12 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         }
         b.extend_from_slice(b"]}]");
     }
+    if let Some(profile) = &p.steering_profile {
+        b.extend_from_slice(b",\"steering_profile\":");
+        pyjson::string(b, profile);
+        b.extend_from_slice(b",\"steering_scale\":");
+        pyjson::float(b, p.steering_scale.unwrap_or(1.0));
+    }
     b.extend_from_slice(b",\"type\":\"generate\"}");
     w.finish()
 }
@@ -284,6 +292,8 @@ mod tests {
             prompt_logprobs: None,
             system_tokens: Some(2),
             insert: None,
+            steering_profile: None,
+            steering_scale: None,
         };
         let mut all = Vec::new();
         all.extend_from_slice(&generate("cmpl-1", &[10, 20, 30], &p));

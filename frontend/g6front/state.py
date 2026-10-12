@@ -32,6 +32,10 @@ class State:
         return 0
 
     @property
+    def steering(self) -> dict | None:
+        return (self.engine.hello or {}).get('steering')
+
+    @property
     def max_logprobs(self) -> int:
         return int((self.engine.hello or {}).get('max_logprobs', 20))
 

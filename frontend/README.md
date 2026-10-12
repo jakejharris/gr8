@@ -37,6 +37,13 @@ about 0.3 s at TP=4. Plain `/health` is unchanged.
 A rank whose weights changed has `"changed": N` and, for the first chunk that differs, `"first": {"offset": ..., "end":
 ..., "starts_in": "..."}`: its bytes, and the tensor it starts in (a 32 MB chunk can hold several tensors).
 
+`GET /health` also returns a sanitized steering receipt. A loaded profile reports its name, manifest-digest prefix,
+scope, active layer count and whether process-wide forced mode is active.
+
+Both completion endpoints accept optional `steering_profile` and `steering_scale` vendor fields when the engine hello
+advertises a loaded profile. Omitting both is off; omitting the scale uses 1.0. Scale is finite in `[0, 4]`, and a
+standalone zero canonicalizes to off. See [docs/STEERING.md](../docs/STEERING.md).
+
 ## Build and run (on the head)
 
 `./gr8 glm53 up` starts it. By hand, with the shim already listening on `--engine-sock`:

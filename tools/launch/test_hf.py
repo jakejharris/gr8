@@ -26,6 +26,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, REPO)
 import hfsource  # noqa: E402
 import modelset  # noqa: E402
+from tools.steering import release as steering_release  # noqa: E402
 
 try:
     import numpy  # noqa: F401
@@ -101,6 +102,32 @@ def make_release(root):
         put(f'dense/{name}.safetensors', rnd.bytes(300_000))
     for name in hfsource.META_FILES:
         put(name, f'{{"{name}": 1}}'.encode())
+    directions = b'\0\0\x80?' * 8
+    steering_manifest = {
+        'schema_version': 1, 'profile_name': 'test-default',
+        'model': {'name': 'glm-5.3', 'revision': 'base-rev', 'weight_set': '5e' * 32,
+                  'tokenizer_revision': 'base-rev',
+                  'chat_template_sha256': hashlib.sha256(b'{"chat_template.jinja": 1}').hexdigest(),
+                  'hidden_size': 4, 'layer_count': 78},
+        'scope': 'shared', 'layers': [2, 3], 'alphas': [1.0, 1.0],
+        'directions': {'file': 'directions.f32', 'dtype': 'float32-le', 'byte_count': len(directions),
+                       'sha256': hashlib.sha256(directions).hexdigest()},
+        'provenance': {'extraction_tool': 'fixture', 'extraction_commit': 'fixture',
+                       'dataset_manifests': {'train': '1' * 64, 'validation': '2' * 64, 'final': '3' * 64}}}
+    profile_dir = os.path.join(root, '.profile-fixture')
+    os.makedirs(profile_dir)
+    put('.profile-fixture/manifest.json', json.dumps(steering_manifest).encode())
+    put('.profile-fixture/directions.f32', directions)
+    artifact = os.path.join(root, 'steering', 'test-default.safetensors')
+    steering_release.pack(profile_dir, artifact)
+    os.unlink(os.path.join(profile_dir, 'manifest.json')); os.unlink(os.path.join(profile_dir, 'directions.f32'))
+    os.rmdir(profile_dir)
+    with open(artifact, 'rb') as f:
+        artifact_bytes = f.read()
+    index = {'schema_version': 1, 'default_profile': 'test-default', 'profiles': [{
+        'name': 'test-default', 'file': 'steering/test-default.safetensors',
+        'sha256': hashlib.sha256(artifact_bytes).hexdigest(), 'byte_count': len(artifact_bytes)}]}
+    put('steering/index.json', (json.dumps(index, sort_keys=True, separators=(',', ':')) + '\n').encode())
     put('README.md', b'fake release\n')
     for d, _, files in os.walk(root):
         for n in files:
@@ -330,6 +357,18 @@ class HFTests(unittest.TestCase):
         self.assertNotIn('--manifest', plan['args'])
         self.assertEqual(modelset.needed(ms.set, 2, plan), {})
         self.assertEqual(str(ms.release), ms.source)
+        self.assertTrue(o.get('STEERING_PROFILE').endswith('/steering/profiles/test-default'))
+        self.assertEqual(o.get('STEERING_WEIGHT_SET'), '5e' * 32)
+        self.assertEqual(o.get('STEERING_MODEL_REVISION'), 'base-rev')
+        self.assertIn('--steering-weight-set', plan['args'])
+
+    def test_release_without_steering_still_works(self):
+        plain = shutil.copytree(self.r1, os.path.join(self.cache, 'plain'))
+        shutil.rmtree(os.path.join(plain, 'steering'))
+        c = 'd' * 40
+        self.hub.repos[RELEASE][c] = plain
+        r = self.release(c)
+        self.assertIsNone(r.steering_profile)
 
     def test_commit_is_recorded_and_refreshed(self):
         r = self.release()

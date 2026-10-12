@@ -80,12 +80,22 @@ class UnitTests(unittest.TestCase):
 
     def test_parse_ready(self):
         c = g6s2shim.parse_ready('G6S2 1 7 6 20000 2 4 8\n')
-        self.assertEqual(c, {'max_lp': 0, 'epoch': 7, 'ranks': 6, 'pool_rows': 20000, 'mtp': 2, 'guard': 4, 'max_rows': 8,
-                             'insert': False})
+        self.assertEqual(c, {'max_lp': 0, 'epoch': 7, 'ranks': 6, 'pool_rows': 20000, 'mtp': 2, 'guard': 4,
+                             'max_rows': 8, 'insert': False, 'steering': None})
         self.assertEqual(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['max_lp'], 20)
         self.assertFalse(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['insert'])
         self.assertTrue(g6s2shim.parse_ready('G6S2 3 7 6 20000 2 4 8 20\n')['insert'])
-        for bad in ('G6S2 2 7 6 20000 2 4 8\n', 'G6S2 1 7 6 20000 2 4 8 20\n', 'G6S2 4 7 6 20000 2 4 8 20\n',
+        v4 = 'G6S2 4 7 4 20000 2 4 8 20 own-refusal-v1 ' + 'a' * 64 + ' full 48 0 0'
+        c = g6s2shim.parse_ready(v4 + '\n')
+        self.assertTrue(c['insert'])
+        self.assertEqual(c['steering'], {'profile': 'own-refusal-v1', 'digest': 'a' * 64, 'scope': 'full',
+                                         'layers': 48, 'forced': False, 'forced_scale': 0.0})
+        with self.assertRaises(ValueError):
+            g6s2shim.parse_ready(v4.rsplit(' ', 1)[0] + ' 1\n')
+        with self.assertRaises(ValueError):
+            g6s2shim.parse_ready(v4.replace(' full 48 ', ' full 0 ') + '\n')
+        for bad in ('G6S2 2 7 6 20000 2 4 8\n', 'G6S2 1 7 6 20000 2 4 8 20\n',
+                    'G6S2 4 7 6 20000 2 4 8 20\n',
                     'G6S2 1 7 6\n', 'ready\n', 'G6S2 1 7 6 20000 2 4 x\n'):
             with self.assertRaises(ValueError):
                 g6s2shim.parse_ready(bad)
@@ -117,6 +127,14 @@ class UnitTests(unittest.TestCase):
         self.assertIn(b' top_p 1.0 sys 2\n', g6s2shim.build_request({'prompt': [1, 2, 3], 'max_tokens': 4, 'system_tokens': 2}, 0)[0])
         self.assertEqual(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'system_tokens': 5}, 0)[1],
                          'system_tokens must be 0..len(prompt)')
+        cap = {'profile': 'own-refusal-v1', 'forced': False, 'forced_scale': 0.0}
+        body, err = g6s2shim.build_request(
+            {'prompt': [1], 'max_tokens': 4, 'steering_profile': 'own-refusal-v1'}, 0, cap)
+        self.assertIsNone(err)
+        self.assertIn(b' steer own-refusal-v1 3f800000\n', body)
+        self.assertIn('unknown steering_profile', g6s2shim.build_request(
+            {'prompt': [1], 'max_tokens': 4, 'steering_profile': 'other'}, 0, cap)[1])
+
         for lp in (-1, 21, 1.5, True, '3'):
             for key in ('logprobs', 'prompt_logprobs'):
                 self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, key: lp}, 0)[1], (key, lp))

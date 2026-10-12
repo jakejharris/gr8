@@ -601,6 +601,8 @@ mod tests {
                 prompt_logprobs: None,
                 system_tokens: None,
                 insert: None,
+                steering_profile: None,
+                steering_scale: None,
             },
             stop: vec![],
             include_stop: false,

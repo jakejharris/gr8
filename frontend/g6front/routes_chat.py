@@ -43,6 +43,7 @@ async def prepare(st: State, body: dict):
     span = await system_span(st, body, tools, kw, prompt)
     if span is not None:
         params['system_tokens'] = span
+    params.update(sampling.steering(body, st.steering))
     return tools, tool_choice, prompt, params
 
 

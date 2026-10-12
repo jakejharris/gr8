@@ -2,12 +2,14 @@
 // (g6m4 --serve, s2/sessions.h) parses the same request format itself and writes the same response lines through
 // Emitter, plus its own `a` line (frontend/g6s2shim.py describes the S2 files).
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
-//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>] [lp <k>] [plp <k>]
+//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>] [lp <k>]
+//       [plp <k>] [steer <profile> <binary32 bits in hex>]
 //       (lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
 //        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
 //       <prompt ids, comma-separated>
 //   DIR/quit     ends the loop
-//   DIR/ready    written once the model is loaded, before the first request is read
+//   DIR/ready    (every rank) written once the model is loaded, before the first request is read. Empty without a
+//                steering profile; otherwise: G6STEER 1 <profile> <manifest-sha256> <scope> <layers> <forced> <scale-bits>
 //   DIR/resp.<n> (rank 0, one flushed line per event):
 //       l <lp> <rank> <n> <id>:<lp> ..                   with lp: one line per token of the next t line, before it
 //                                                        (lp: logprob of the token; rank: 1 = best, -1 = beyond the top 20;
@@ -17,6 +19,7 @@
 //       m <rounds> <draft_tokens> <accepted> <acc_pos0> ..   cumulative MTP counters since start
 //       end <stop|length|error> <stop_id|-1> <completion_tokens>
 #pragma once
+#include "steering.h"
 #include <sys/stat.h>
 #include <chrono>
 #include <ctime>
@@ -41,6 +44,7 @@ struct ServeReq
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
     InsertRule ins;               // S2 only (s2/sessions.h parse_request)
+    steering::Identity steering;
 };
 
 constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)
@@ -56,16 +60,25 @@ struct LpRow
 
 inline bool serve_exists(const std::string& p) { struct stat s; return stat(p.c_str(), &s) == 0; }
 
-// DIR/ready: the rank has loaded and waits for requests
-inline void serve_ready(const std::string& dir)
+// DIR/ready: the rank has loaded and waits for requests. A loaded profile adds a fixed receipt so the ordinary shim
+// can compare all ranks before advertising the capability. The empty file remains the exact no-profile protocol.
+inline void serve_ready(const std::string& dir, const steering::BootConfig& s = {})
 {
-    if (FILE* f = fopen((dir + "/ready").c_str(), "w")) fclose(f);
+    const std::string tmp = dir + "/ready.tmp", ready = dir + "/ready";
+    FILE* f = fopen(tmp.c_str(), "w");
+    if (!f) return;
+    if (s.loaded)
+        std::fprintf(f, "G6STEER 1 %s %s %s %u %u %u\n", s.profile_name.c_str(),
+                     steering::digest_hex(s.profile_digest).c_str(), steering::scope_name(s.scope), s.active_layers,
+                     unsigned(s.forced), s.forced_scale_bits);
+    const bool ok = fclose(f) == 0 && ::rename(tmp.c_str(), ready.c_str()) == 0;
+    if (!ok) ::unlink(tmp.c_str());
 }
 
 // A request file's text -> r. Line 1 holds the parameters, at any length; line 2 the prompt ids. Any malformed field, or
 // a stop or prompt id outside 0..vocab-1 (the kernels index the embedding table with prompt ids unchecked), leaves
 // r.n_gen = 0, which every rank answers with "end error".
-inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
+inline void serve_parse(const std::string& text, int vocab, ServeReq& r, const steering::BootConfig& steer = {})
 {
     r = ServeReq();
     const size_t nl = text.find('\n');
@@ -110,19 +123,33 @@ inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
                     !ids.empty() && list(ids, r.prompt);
     if (!ok) { r = ServeReq(); return; }
     r.n_gen = (int)n_gen; r.seed = (uint32_t)seed; r.min_tokens = (int)min_tokens;
-    for (size_t i = 10; i + 1 < w.size(); i += 2)                  // optional (older shims: absent)
+    bool tail_ok = true;
+    steering::RequestFields sf;
+    for (size_t i = 10; i < w.size();)                            // optional (older shims: absent)
     {
+        if (i + 1 >= w.size()) { tail_ok = false; break; }
         long k;
-        if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) r.top_p = 0.f; }
-        // the shim never sends k > LP_MAX; clamping is a backstop
-        else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
-        else if (w[i] == "plp") r.plp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
-        else break;
+        if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) tail_ok = false; i += 2; }
+        // the shim never sends k > LP_MAX; strict parsing is a backstop
+        else if (w[i] == "lp") { if (!num(w[i + 1], 0, LP_MAX, &k)) tail_ok = false; else r.lp = int(k); i += 2; }
+        else if (w[i] == "plp") { if (!num(w[i + 1], 0, LP_MAX, &k)) tail_ok = false; else r.plp = int(k); i += 2; }
+        else if (w[i] == "sys") { if (!num(w[i + 1], 0, long(r.prompt.size()), &k)) tail_ok = false; else r.sys = k; i += 2; }
+        else if (w[i] == "steer") {
+            if (i + 2 >= w.size() || !steering::valid_profile_name(w[i + 1])) { tail_ok = false; break; }
+            try {
+                const uint32_t bits = steering::parse_scale_bits(w[i + 2]);
+                sf.has_profile = true; sf.has_scale = true; sf.profile = w[i + 1]; sf.scale = steering::bits_float(bits);
+            } catch (...) { tail_ok = false; }
+            i += 3;
+        } else { tail_ok = false; break; }
+
     }
+    try { if (tail_ok) r.steering = steer.resolve(sf); } catch (...) { tail_ok = false; }
+    if (!tail_ok) r = ServeReq();
 }
 
 // blocks until DIR/req.<n> or DIR/quit exists; false on quit
-inline bool serve_next(const std::string& dir, size_t n, int vocab, ServeReq& r)
+inline bool serve_next(const std::string& dir, size_t n, int vocab, ServeReq& r, const steering::BootConfig& steer = {})
 {
     const std::string f = dir + "/req." + std::to_string(n);
     for (;;)
@@ -137,7 +164,7 @@ inline bool serve_next(const std::string& dir, size_t n, int vocab, ServeReq& r)
     int c;
     while ((c = fgetc(fp)) != EOF) text.push_back((char)c);
     fclose(fp);
-    serve_parse(text, vocab, r);
+    serve_parse(text, vocab, r, steer);
     return true;
 }
 

@@ -2,7 +2,10 @@
 # runtime image.
 .git
 .github
-bin*
+bin/**
+bin3/**
+bin4/**
+bin6/**
 **/target
 **/__pycache__
 **/*.pyc

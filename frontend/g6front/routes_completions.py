@@ -42,6 +42,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
         prompt = await _prompt_ids(st, body)
         params = sampling.build(body, len(prompt), st.max_model_len, st.tok.eos_ids, st.tok.gen_defaults, 16,
                                 st.max_logprobs, chat=False)
+        params.update(sampling.steering(body, st.steering))
     except ApiError as e:
         return e.response()
     rid = new_id('cmpl')

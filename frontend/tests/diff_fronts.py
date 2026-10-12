@@ -5,10 +5,11 @@ Starts two mock engines (one per front end, so prefix-cache and metrics state ev
 front end on one and g6front-rs on the other, sends every case to both in the same order and diffs the raw
 response bodies after normalizing only what is random by design: response/tool-call ids and `created`.
 
-usage: diff_fronts.py --model-dir DIR --rust-bin PATH [--py PYTHON] [--keep] [-k SUBSTR] [-v]
+usage: diff_fronts.py --model-dir DIR --rust-bin PATH [--py PYTHON] [--keep] [-k SUBSTR] [-v] [--steering]
 Then replays every case that succeeded, all at once, against g6front-rs (frames of different requests interleave on
 its one engine connection) and checks each answer equals its sequential answer.
 Exit status 0 = all cases identical.
+--steering makes the mock engines advertise a loaded `own-refusal-v1` profile.
 """
 import argparse
 import concurrent.futures
@@ -121,6 +122,20 @@ CASES = {
                                 add_generation_prompt=False, continue_final_message=True),
     'chat_name_field': chat([{'role': 'user', 'content': 'hi', 'name': 'bob'}]),
     'chat_unicode': chat([U('héllo wörld 你好 🙂 \u0000 \t tab "quote" \\ back')]),
+    # ---- generic runtime steering vendor fields
+    'steer_chat_default': chat([U('Tell me about harbors.')], steering_profile='own-refusal-v1'),
+    'steer_chat_scale': chat([U('Tell me about harbors.')], steering_profile='own-refusal-v1', steering_scale=1.1),
+    'steer_cmpl': cmpl('Once upon a time', steering_profile='own-refusal-v1', steering_scale=2),
+    'steer_scale_zero': chat([U('x')], steering_scale=0),
+    'steer_scale_negative_zero': chat([U('x')], steering_scale=-0.0),
+    'steer_err_unknown': chat([U('x')], steering_profile='unknown'),
+    'steer_err_profile_chars': chat([U('x')], steering_profile='bad/name'),
+    'steer_err_scale_without_profile': chat([U('x')], steering_scale=.5),
+    'steer_err_profile_type': chat([U('x')], steering_profile=7),
+    'steer_err_scale_type': chat([U('x')], steering_profile='own-refusal-v1', steering_scale='1'),
+    'steer_err_scale_bool': chat([U('x')], steering_profile='own-refusal-v1', steering_scale=True),
+    'steer_err_scale_low': chat([U('x')], steering_profile='own-refusal-v1', steering_scale=-.01),
+    'steer_err_scale_high': chat([U('x')], steering_profile='own-refusal-v1', steering_scale=4.01),
     # ---- tools
     'tool_call': chat([U('weather?')], tools=TOOLS, max_tokens=200),
     'tool_call_stream': chat([U('weather?')], tools=TOOLS, max_tokens=200, stream=True),
@@ -299,6 +314,7 @@ def main():
     ap.add_argument('--front-args', default='', help='extra flags for both front ends')
     ap.add_argument('-k', default='', help='only cases containing this substring')
     ap.add_argument('-v', action='store_true', help='print both bodies for mismatches')
+    ap.add_argument('--steering', action='store_true', help='the mock engines advertise a loaded steering profile')
     a = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix='g6diff-')
@@ -315,7 +331,8 @@ def main():
         for side in ('py', 'rs'):
             socks[side] = os.path.join(work, f'mock-{side}.sock')
             spawn(f'mock-{side}', [a.py, os.path.join(FRONT, 'mock_engine.py'), '--model-dir', a.model_dir,
-                                   '--sock', socks[side], '--rounds-per-s', '0'])
+                                   '--sock', socks[side], '--rounds-per-s', '0',
+                                   *(['--steering'] if a.steering else [])])
         for _ in range(100):
             if all(os.path.exists(s) for s in socks.values()):
                 break

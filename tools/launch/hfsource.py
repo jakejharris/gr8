@@ -33,12 +33,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 import modelset
 
+TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+from steering import release as steering_release  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # The DFlash2 drafter for GLM 5.3. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
 # fetches the drafter from its own repo and converts its rank with bin/g6load dflash2 (the same bytes as
 # tools/convert/dflash2.py, without numpy).
 DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
+STEERING_INDEX = 'steering/index.json'
 CHUNK = 64 << 20
 
 
@@ -221,6 +227,7 @@ class Release:
         self.slices = os.path.join(self.dir, 'index-slices')
         self.tokenizer = os.path.join(self.dir, 'tokenizer')
         self.manifests = os.path.join(self.dir, 'manifests')
+        self.steering_profile = None
 
     @property
     def commit(self):
@@ -237,6 +244,10 @@ class Release:
         """The manifests and the tokenizer and config files. Once there, a boot needs no network for them."""
         done = os.path.join(self.dir, 'meta.json')
         if os.path.isfile(done):
+            self._load_cached_steering()
+            meta = load_json(done) or {}
+            if STEERING_INDEX in meta.get('files', []) and self.steering_profile is None:
+                self._fetch_steering(self.repo.tree())
             return
         t = self.repo.tree()
         for p in sorted(t):
@@ -247,9 +258,67 @@ class Release:
             raise modelset.ModelError(f'{self} lacks {", ".join(missing)} at its root')
         for name in META_FILES:
             self.repo.fetch(name, os.path.join(self.tokenizer, name))
+        steering_files = self._fetch_steering(t)
         with open(done + '.tmp', 'w') as f:
-            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': list(META_FILES)}, f, indent=1)
+            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': list(META_FILES) + steering_files}, f,
+                      indent=1)
         os.replace(done + '.tmp', done)
+
+    def _fetch_steering(self, tree):
+        """Fetch and materialize the optional default steering profile. A release without it behaves as before."""
+        if STEERING_INDEX not in tree:
+            return []
+        index_path = os.path.join(self.dir, STEERING_INDEX)
+        self.repo.fetch(STEERING_INDEX, index_path)
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+        except (OSError, ValueError) as e:
+            raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid JSON ({e})') from None
+        if set(index) != {'schema_version', 'default_profile', 'profiles'} or index['schema_version'] != 1 or \
+                not isinstance(index['profiles'], list):
+            raise modelset.ModelError(f'{self} {STEERING_INDEX}: want schema_version 1, default_profile and profiles')
+        by_name = {}
+        for rec in index['profiles']:
+            if not isinstance(rec, dict) or set(rec) != {'name', 'file', 'sha256', 'byte_count'}:
+                raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid profile record')
+            name, path = rec['name'], rec['file']
+            if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name) or name in by_name:
+                raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid or duplicate profile name')
+            if path != f'steering/{name}.safetensors' or path not in tree or \
+                    not re.fullmatch(r'[0-9a-f]{64}', str(rec['sha256'])) or \
+                    not isinstance(rec['byte_count'], int) or rec['byte_count'] <= 0:
+                raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid profile file record for {name}')
+            by_name[name] = rec
+        default = index['default_profile']
+        if default not in by_name:
+            raise modelset.ModelError(f'{self} {STEERING_INDEX}: default_profile is not listed')
+        rec = by_name[default]
+        artifact = os.path.join(self.dir, rec['file'])
+        self.repo.fetch(rec['file'], artifact)
+        if os.path.getsize(artifact) != rec['byte_count'] or modelset.sha256_file(artifact) != rec['sha256']:
+            raise modelset.ModelError(f'{self} {rec["file"]}: index size or digest mismatch')
+        out = os.path.join(self.dir, 'steering', 'profiles', default)
+        try:
+            manifest = steering_release.unpack(artifact, out)
+        except (OSError, steering_release.ProfileError) as e:
+            raise modelset.ModelError(f'{self} {rec["file"]}: {e}') from None
+        if manifest.get('profile_name') != default:
+            raise modelset.ModelError(f'{self} {rec["file"]}: embedded profile name differs from the index')
+        self.steering_profile = (out, manifest)
+        return [STEERING_INDEX, rec['file']]
+
+    def _load_cached_steering(self):
+        index = load_json(os.path.join(self.dir, STEERING_INDEX))
+        if not index:
+            return
+        name = index.get('default_profile')
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name):
+            return
+        out = os.path.join(self.dir, 'steering', 'profiles', str(name))
+        manifest = load_json(os.path.join(out, 'manifest.json'))
+        if manifest:
+            self.steering_profile = (out, manifest)
 
     def whole_files(self, tp, rank):
         """The release files this rank loads whole: its index slices, and the dense and vocab files."""

@@ -507,6 +507,11 @@ impl Stash {
     /// resident: the token histories of the runs still in the pool (live and retained), for prefix bases.
     pub(crate) fn put_evicted(&mut self, gone: &[Kept], below_pages: usize, resident: &[&[i32]]) {
         for k in gone {
+            // Model activations differ across steering namespaces. Tier persistence currently stores stock prefixes;
+            // namespaced prefixes stay eligible for in-memory reuse but are never serialized as stock entries.
+            if k.namespace != crate::pool::STOCK_NAMESPACE {
+                continue;
+            }
             self.forget(&k.st);
             if k.st.valid <= 0 {
                 continue;

@@ -165,6 +165,24 @@ def resolve_model(o, refresh=False, log=log):
                                   o.get('MODEL_DIR') or (release.tokenizer if release else None))
             if release:
                 ms.source = f'{release}, base packs {ms.source}'
+        if release and release.steering_profile and not o.get('STEERING_PROFILE') and not o.get('BASE_PACKS'):
+            profile_dir, manifest = release.steering_profile
+            identity = manifest.get('model', {})
+            weights = ms.set.get('source', {}).get('weights')
+            template = os.path.join(ms.tokenizer, 'chat_template.jinja')
+            if identity.get('weight_set') != weights:
+                raise modelset.ModelError(f'{release}: default steering profile is for a different weight set')
+            if identity.get('chat_template_sha256') != opt.file_sha256(template):
+                raise modelset.ModelError(f'{release}: default steering profile is for a different chat template')
+            fields = {'STEERING_PROFILE': profile_dir, 'STEERING_MODEL_REVISION': identity.get('revision'),
+                      'STEERING_TOKENIZER_REVISION': identity.get('tokenizer_revision'),
+                      'STEERING_CHAT_TEMPLATE_SHA256': identity.get('chat_template_sha256'),
+                      'STEERING_WEIGHT_SET': identity.get('weight_set')}
+            if not all(fields.values()):
+                raise modelset.ModelError(f'{release}: default steering profile lacks model identity fields')
+            for key, value in fields.items():
+                o.values[key] = value
+            log(f'{release}: default steering profile {manifest.get("profile_name")} is available on request')
         ms.release = release
         ms.drafter = drafter_of(o, ms, refresh, log)
         search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,

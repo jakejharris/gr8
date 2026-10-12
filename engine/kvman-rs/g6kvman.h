@@ -67,10 +67,11 @@ int g6kv_list(const g6kv_pool* p, const g6kv_run* r, const uint32_t** pages, siz
 void g6kv_keep(g6kv_pool* p, int strict, int noend, int32_t grid);
 int g6kv_keeping(const g6kv_pool* p);
 // retires a run with its session's finished PrefixReuse state, or releases it when valid <= 0 or reuse is off
+// namespace_ is an exact, fixed-size cache identity (70 bytes in this ABI): all zeroes for stock behavior.
 int g6kv_retain(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t n, int32_t valid, int32_t written_end,
-                int32_t pf_end);
+                int32_t pf_end, const uint8_t* namespace_);
 int g6kv_match(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst, int32_t limit,
-               g6kv_hit* out);
+               const uint8_t* namespace_, g6kv_hit* out);
 // from: -1 for a pool hit, else the tier of a stored one
 int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
 

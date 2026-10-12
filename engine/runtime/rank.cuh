@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(128) k_put_publish(const uint4* src, g6::Fabri
     glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
 }
 
-// host -> GPU, once per step. 336 bytes (<= 512), read as 32-bit words by one CTA.
+// host -> GPU, once per step. Steering scales extend this existing control block and transfer; no steering-only copy.
 struct StepIn
 {
     u64 step;
@@ -145,6 +145,7 @@ struct StepIn
     int tok[MX], pos[MX];
     glue::SampleRow srow[MX];
     int tgt[MX];                      // teacher forcing: the id each row should predict (< 0 = none)
+    float steering_scale[MX];         // exact canonical FP32 request scale for each target row; padding is +0
 #ifdef DEC_S2
     int page_bound, pad_s2;           // S2 solo run: the pool's pages, the cells' page_count (0 = the context's pages, today)
 #endif
@@ -161,6 +162,7 @@ struct StepCtl
     const uint32_t* in;               // StepIn
     u64* stepp;
     int *tok, *pos, *tgt;
+    float* steering_scale;
     glue::SampleRow* srow;
     G6AttnStepCell* cells;            // [nl] attention step cells (graph form)
     const int* shared;                // [nl] 1 = the layer reuses another layer's index list
@@ -174,7 +176,8 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
     for (int i = t; i < (int)(sizeof(StepIn) / 4); i += 128) reinterpret_cast<uint32_t*>(&sh)[i] = __ldcv(c.in + i);
     __syncthreads();
     if (t == 0) *c.stepp = sh.step;
-    for (int i = t; i < MX; i += 128) { c.tok[i] = sh.tok[i]; c.pos[i] = sh.pos[i]; c.srow[i] = sh.srow[i]; c.tgt[i] = sh.tgt[i]; }
+    for (int i = t; i < MX; i += 128) { c.tok[i] = sh.tok[i]; c.pos[i] = sh.pos[i]; c.srow[i] = sh.srow[i]; c.tgt[i] = sh.tgt[i];
+                                         c.steering_scale[i] = sh.steering_scale[i]; }
     const int pages = (sh.context + 63) / 64;
     for (int l = t; l < c.nl; l += 128)
     {
@@ -294,6 +297,13 @@ struct Model
     u64* stepp = nullptr;             // device step counter
     unsigned* tickets = nullptr;      // [2*nl+1] publish tickets, device, zero
     float* resid = nullptr;           // [MX][6144]
+    float* steering_scale = nullptr;  // [MX], refreshed by the existing k_step_in launch
+    std::vector<const float*> steering_dir; // [nl], immutable device directions; nullptr for inactive layers
+    std::vector<float> steering_alpha;      // [nl], immutable profile alphas
+    std::vector<float> steering_norm_sq;    // [nl], immutable host-precomputed FP32 direction squared norms
+    steering::Scope steering_scope = steering::Scope::Full;
+    float* steering_part = nullptr;         // [MX][48], deterministic shared-scope finalize reductions
+    unsigned* steering_count = nullptr;     // [MX], shared across stream-ordered layer finalizers
     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;
     __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;
     float *logits = nullptr, *hlog = nullptr, *lp = nullptr, *lpt = nullptr;
@@ -466,6 +476,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     if (f.ncoll != m.ncoll()) die("fabric ncoll must be 2 * layers + 1");
     m.tickets = dmalloc<unsigned>(m.ncoll());
     m.resid = dmalloc<float>((size_t)MX * HID);
+    m.steering_scale = dmalloc<float>(MX);
     m.x = dmalloc<__half>((size_t)MX * HID);
     m.x2 = dmalloc<__half>((size_t)MX * HID);
     m.q_a = dmalloc<__half>((size_t)MX * QA);
@@ -666,6 +677,12 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
         static const int fuse = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1;
         if (const char* e = bind::make_layer(y.T, M, m.sc, io, y.L[M], fuse))
             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
+        if (y.moe && m.steering_scope == steering::Scope::Shared && i < (int)m.steering_dir.size())
+        {
+            bind::K1& k = y.L[M].k1;
+            k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
+            k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
+        }
         if (y.L[M].heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
 #ifdef DEC_SLOT
         // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)
@@ -913,6 +930,10 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
 {
     glue::ArNormArgs a{m.f, m.stepp, c, M, m.resid, w, out, glue::RMS_EPS};
+    const int i = c / 2;
+    if (i < (int)m.steering_dir.size() &&
+        (c % 2 == 0 || m.steering_scope == steering::Scope::Full || !m.layers[i].moe))
+        a.steer = {m.steering_dir[i], m.steering_scale, 0.f, m.steering_alpha[i], m.steering_norm_sq[i]};
 #ifdef DEC_SLOT
     // fold: the normed rows also go into the fragment tables the next kernel reads (xf_x2 of this layer, xf_x of the
     // next; after the last layer the head's xf_h still runs)
@@ -1077,8 +1098,8 @@ inline void reset(Model& m, cudaStream_t st)
 }
 inline void launch_step_in(Model& m, cudaStream_t st)
 {
-    k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt, m.srow, m.cells,
-                                         m.shared, m.nl});
+    k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
+                                         m.steering_scale, m.srow, m.cells, m.shared, m.nl});
 #ifdef DEC_S2
     if (m.s2on) s2_launch_cells(m, st);
 #endif
@@ -1330,6 +1351,8 @@ struct Plan
     int lp = -1, plp = -1;            // --serve: top-k logprobs of the generated / the prompt tokens (k > 0 = top lists; 0 = only
                                       // the token's own logprob; -1 = off). Rows of a step with k > 0 carry SampleRow::topk.
     bool rs = false;                  // --spec-accept rejection: drafts are greedy, the target accepts them by rejection sampling
+    float steering_scale = 0.f;       // target model only; exact canonical bits from the effective request identity
+    steering::Identity steering{};    // full cache identity (profile/scope/schedule/exact scale)
 };
 inline int prompt_steps(const Plan& p) { return ((int)p.prompt.size() - p.first + p.chunk - 1) / p.chunk; }
 inline int total_steps(const Plan& p) { return prompt_steps(p) + p.n_gen; }
@@ -1365,6 +1388,7 @@ inline StepIn step_inputs(const Plan& p, int s, int last_tok, u64 step0 = 0)
         in.pos[r] = s < ps ? p.first + s * p.chunk + r : n + s - ps;
         in.tgt[r] = in.pos[r] + 1 < n ? p.prompt[in.pos[r] + 1] : -1;
         in.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, in.pos[r] + 1, 0, p.top_p, (in.tgt[r] >= 0 ? p.plp : p.lp) > 0 ? 1 : 0};
+        in.steering_scale[r] = p.steering_scale;
     }
     in.context = in.pos[M - 1] + 1;
     return in;
@@ -1577,6 +1601,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
             si.pos[r] = base + r;
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
+            si.steering_scale[r] = p.steering_scale;
         }
         si.context = base + k + 1;
         double tv = 0, tf = 0;

@@ -68,6 +68,11 @@ manifest instead.
 | `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
 | `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
 | `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
+| `STEERING_PROFILE` | unset | unset | unset | schema-v1 steering profile directory; each box may use its own path, while the engine boot compares the content receipt |
+| `STEERING_FORCE` | unset | unset | unset | process-wide qualification scale in `(0, 4]`; requests cannot override it |
+| `STEERING_MODEL_REVISION` | unset | unset | unset | exact model revision required by the profile |
+| `STEERING_TOKENIZER_REVISION` | unset | unset | unset | exact served tokenizer revision required by the profile |
+| `STEERING_CHAT_TEMPLATE_SHA256` | unset | unset | unset | lowercase SHA-256 of the exact served chat template required by the profile |
 
 ## `./gr8 glm53`
 
@@ -86,6 +91,12 @@ manifest instead.
 | `V2_DENSE_FORM` | `--v2-dense-form` | `trellis` | cluster | with `V2_DENSE`: `trellis` keeps q_b, o_proj and the dense MLP as the release's trellis entries for the dense trellis kernels, so the weights are the release's own. `rounded` is the fallback: it rounds them to the MXFP8 and int4 forms of a converted pack |
 | `DRAFTER` | `--drafter` | none | box | TP=4: the DFlash2 drafter's repo, `https://huggingface.co/incoai/GLM-5.3-DFlash2`. Each box fetches it and converts its rank into `MODEL_CACHE`. Its repo and commit go into the id the boxes compare |
 | `DFLASH_DIR` | `--dflash-dir` | none | box | a directory holding `dflash.r<r>.*`, when it is not the model set's |
+| `STEERING_PROFILE` | `--steering-profile` | none | box | schema-v1 steering profile directory; each box may use its own path, while the engine boot compares the content receipt |
+| `STEERING_FORCE` | `--steering-force` | none | cluster | force the loaded profile at this scale for qualification; finite and in `(0, 4]` |
+| `STEERING_MODEL_REVISION` | `--steering-model-revision` | none | cluster | exact model revision in the profile manifest |
+| `STEERING_WEIGHT_SET` | `--steering-weight-set` | `SET_ID` | cluster | stable exlr8 weight-set identity in the profile manifest; auto-filled for HF profiles |
+| `STEERING_TOKENIZER_REVISION` | `--steering-tokenizer-revision` | none | cluster | exact tokenizer revision in the profile manifest |
+| `STEERING_CHAT_TEMPLATE_SHA256` | `--steering-chat-template-sha256` | none | cluster | SHA-256 of the served chat template in the profile manifest |
 | `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |
 | `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |

@@ -28,7 +28,14 @@ int main()
     CHECK(r.plp == -1 && r.stop == (std::vector<int>{154820, 154827}) && r.prompt == (std::vector<int>{5, 6, 154879}));
     r = parse("n_gen 4 temp 0 seed 1 min 0 stop -\n7\n");            // no stop ids, no optional keys (older shims)
     CHECK(r.n_gen == 4 && r.stop.empty() && r.top_p == 0.f && r.prompt == std::vector<int>{7});
-    CHECK(parse("n_gen 4 temp 0 seed 1 min 0 stop - lp 99\n7\n").lp == LP_MAX);   // clamped, as before
+    CHECK(refused("n_gen 4 temp 0 seed 1 min 0 stop - lp 99\n7\n")); // steering release rejects out-of-range fields
+
+    steering::BootConfig sb; sb.loaded = true; sb.profile_name = "own-refusal-v1";
+    sb.scope = steering::Scope::Full; sb.profile_digest[0] = 1; sb.schedule_digest[0] = 2;
+    ServeReq sr; serve_parse("n_gen 4 temp 0 seed 1 min 0 stop - steer own-refusal-v1 3f800000\n7\n", V, sr, sb);
+    CHECK(sr.n_gen == 4 && sr.steering.enabled && steering::bits_float(sr.steering.scale_bits) == 1.0f);
+    serve_parse("n_gen 4 temp 0 seed 1 min 0 stop - steer other 3f800000\n7\n", V, sr, sb);
+    CHECK(sr.n_gen == 0);
 
     // a stop field longer than the old 65535-char buffer: read whole, and nothing of it reaches the prompt
     std::string stops;

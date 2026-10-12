@@ -57,7 +57,13 @@ async def models(request: web.Request) -> web.Response:
 
 async def health(request: web.Request) -> web.Response:
     st: State = request.app['state']
-    return web.Response(status=200 if st.engine.ready else 503)
+    capability = st.steering
+    steering = {'enabled': capability is not None, 'forced': bool(capability and capability.get('forced'))}
+    if capability:
+        steering.update({'profile': capability['profile'], 'digest': capability['digest'][:12],
+                         'scope': capability['scope'], 'layers': capability['layers']})
+    return web.json_response({'ready': st.engine.ready, 'steering': steering},
+                             status=200 if st.engine.ready else 503, dumps=dumps)
 
 
 async def metrics(request: web.Request) -> web.Response:

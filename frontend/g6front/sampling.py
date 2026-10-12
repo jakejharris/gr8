@@ -1,7 +1,44 @@
 """OpenAI/vLLM request fields -> PROTOCOL.md `generate` fields, with vLLM's defaults and validation."""
+import math
+import re
+import struct
+
 from .errors import ApiError
 
 _INT64 = 1 << 63
+
+
+def steering(body: dict, capability: dict | None) -> dict:
+    """Validate vendor steering fields against the immutable engine hello and return generate-frame fields."""
+    hp = body.get('steering_profile') is not None
+    hs = body.get('steering_scale') is not None
+    if not hp and not hs:
+        return {}
+    profile = body.get('steering_profile')
+    if hp and (not isinstance(profile, str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', profile)):
+        raise ApiError('steering_profile must be a profile name', param='steering_profile')
+    value = body.get('steering_scale', 1.0 if hp else 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ApiError('steering_scale must be a number', param='steering_scale')
+    try:
+        scale = struct.unpack('!f', struct.pack('!f', float(value)))[0]
+    except (OverflowError, struct.error):
+        raise ApiError('steering_scale must be finite and in [0, 4]', param='steering_scale')
+    if scale == 0.0:
+        scale = 0.0
+    if not math.isfinite(scale) or not 0.0 <= scale <= 4.0:
+        raise ApiError('steering_scale must be finite and in [0, 4]', param='steering_scale')
+    if not hp:
+        if scale != 0.0:
+            raise ApiError('steering_scale requires steering_profile', param='steering_scale')
+        if capability and capability.get('forced'):
+            raise ApiError('request steering conflicts with forced mode', param='steering_scale')
+        return {}                    # scale-only canonical zero normalizes to off
+    if not capability or profile != capability.get('profile'):
+        raise ApiError('unknown steering_profile', param='steering_profile')
+    if capability.get('forced') and scale != capability.get('forced_scale'):
+        raise ApiError('request steering conflicts with forced mode', param='steering_scale')
+    return {'steering_profile': profile, 'steering_scale': scale}
 
 
 def _num(body, key, lo=None, hi=None, kind=float):

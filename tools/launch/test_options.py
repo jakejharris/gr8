@@ -355,6 +355,57 @@ class KvStoreTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-write-limit', 'lots'], 'per page computed')):
             v.check(['--peers', PEERS, *argv], want)
+class SteeringOptionTests(unittest.TestCase):
+    SHA = 'a' * 64
+
+    def opts(self, *extra):
+        o = opt.parse(['--no-config', '--peers', PEERS, *extra], {})
+        opt.validate(o)
+        return o
+
+    def steering(self, path='/profiles/p', force=None):
+        out = ['--steering-profile', path, '--steering-model-revision', 'rev-1',
+               '--steering-tokenizer-revision', 'tok-1', '--steering-chat-template-sha256', self.SHA,
+               '--steering-weight-set', 'b' * 64]
+        if force is not None:
+            out += ['--steering-force', force]
+        return out
+
+    def test_profile_is_a_per_box_path_and_all_identity_fields_reach_the_engine(self):
+        o = self.opts(*self.steering(force='1.25'))
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', epoch=2, set_id='b' * 64)
+        args = ' '.join(p['args'])
+        self.assertIn('--steering-profile /profiles/p', args)
+        self.assertIn('--steering-model-revision rev-1', args)
+        self.assertIn('--steering-tokenizer-revision tok-1', args)
+        self.assertIn('--steering-chat-template-sha256 ' + self.SHA, args)
+        self.assertIn('--steering-weight-set ' + 'b' * 64, args)
+        self.assertIn('--steering-force 1.25', args)
+        members = opt.split_list(PEERS)
+        _, text, digest = opt.canonical(o, opt.engine_plan(o), members)
+        self.assertIn('--steering-profile @STEERING_PROFILE', text)
+        other = self.opts(*self.steering('/another/box/path', force='1.25'))
+        self.assertEqual(digest, opt.canonical(other, opt.engine_plan(other), members)[2])
+        changed = self.opts(*self.steering(force='2'))
+        self.assertNotEqual(digest, opt.canonical(changed, opt.engine_plan(changed), members)[2])
+
+    def test_refusals(self):
+        bad = [
+            (['--steering-force', '1'], '--steering-force needs'),
+            (['--steering-profile', '/p'], '--steering-profile needs'),
+            (self.steering()[:6], '--steering-profile needs'),
+            (self.steering()[:7] + ['A' * 64] + self.steering()[8:], '64 lowercase hex'),
+            (self.steering()[:-1] + ['A' * 64], '--steering-weight-set'),
+        ]
+        for argv, message in bad:
+            with self.assertRaises(opt.OptionError) as e:
+                self.opts(*argv)
+            self.assertIn(message, str(e.exception))
+        for value in ('0', '-1', '4.1', 'nan', 'inf', 'word'):
+            with self.assertRaises(opt.OptionError, msg=value):
+                self.opts(*self.steering(force=value))
+        self.opts(*self.steering(force='4'))
+
 
 
 class KvFormatTests(unittest.TestCase):

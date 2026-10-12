@@ -31,14 +31,14 @@ WORKDIR /src
 FROM rust AS loader
 COPY engine/loader-rs engine/loader-rs
 RUN mkdir -p /out \
- && cargo build --release --locked --manifest-path engine/loader-rs/Cargo.toml \
+ && cargo build --release --locked --lib --bins --manifest-path engine/loader-rs/Cargo.toml \
  && cp engine/loader-rs/target/release/libg6load.a engine/loader-rs/target/release/g6load /out/ \
  && rm -rf engine/loader-rs/target
 
 FROM rust AS kvman
 COPY engine/kvman-rs engine/kvman-rs
 RUN mkdir -p /out \
- && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
+ && cargo build --release --locked --lib --bins --manifest-path engine/kvman-rs/Cargo.toml \
  && cp engine/kvman-rs/target/release/libg6kvman.a engine/kvman-rs/target/release/kvman-remote /out/ \
  && rm -rf engine/kvman-rs/target
 

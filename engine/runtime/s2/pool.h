@@ -52,6 +52,7 @@ public:
         Lock l(mu_); const g6kv_run x = c(r); g6kv_run out; int granted = 0;
         check(g6kv_grow(p_, &x, rows, &out, &granted));
         return granted ? std::optional<Run>(run(out)) : std::nullopt;
+
     }
     void release(const Run& r) { Lock l(mu_); const g6kv_run x = c(r); check(g6kv_release(p_, &x)); }
     // a live run's pages, in table order, and whether it is exclusive (its table is the CP map as built)
@@ -69,18 +70,24 @@ public:
     void keep(const g6rt::PrefixReuse& rules) { Lock l(mu_); g6kv_keep(p_, rules.strict, rules.noend, rules.grid); }
     bool keeping() const { Lock l(mu_); return g6kv_keeping(p_); }
     // a retiring session's run: retained with its finished reuse state (st.valid rows), or released when nothing is valid
-    void retain(const Run& r, const g6rt::PrefixReuse& st) {
+    void retain(const Run& r, const g6rt::PrefixReuse& st, const g6rt::steering::Identity& steering = {}) {
         Lock l(mu_); const g6kv_run x = c(r);
-        check(g6kv_retain(p_, &x, st.history.data(), st.history.size(), st.valid, st.written_end, st.pf_end));
+        const auto ns = g6rt::steering::cache_namespace(steering);
+        check(g6kv_retain(p_, &x, st.history.data(), st.history.size(), st.valid, st.written_end, st.pf_end, ns.data()));
     }
     // head, at admission (workers at their grant): the retained run with the longest reusable prefix for `prompt` (limit:
     // rows the prefill may skip) that the request (`rows` now, `worst` at most) can grow from. Ties go to the most recent.
-    PoolHit match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit) const {
+    PoolHit match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
+                  const g6rt::steering::Identity& steering = {}) const {
         Lock l(mu_); g6kv_hit h;
-        check(g6kv_match(p_, prompt.data(), prompt.size(), rows, worst, limit, &h));
+        const auto ns = g6rt::steering::cache_namespace(steering);
+        check(g6kv_match(p_, prompt.data(), prompt.size(), rows, worst, limit, ns.data(), &h));
         return PoolHit{h.skip, h.lcp, h.why, h.age, h.stored != 0, h.tier};
     }
-    PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit) const { return match(prompt, rows, rows, limit); }
+    PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit,
+                  const g6rt::steering::Identity& steering = {}) const {
+        return match(prompt, rows, rows, limit, steering);
+    }
     // claim a match() hit as a new grant (a fresh table version, as reserve)
     Run take(const PoolHit& h, uint64_t rows, uint64_t worst) {
         Lock l(mu_); g6kv_run r; check(g6kv_take(p_, h.skip, h.age, h.stored ? int32_t(h.tier) : -1, rows, worst, &r)); return run(r);
@@ -139,6 +146,7 @@ public:
         g6kv_stored_summary(p_, s.data(), s.size());
         s.pop_back();
         return s;
+
     }
     void keep_agreed(const std::string& agreed) { Lock l(mu_); g6kv_keep_agreed(p_, agreed.c_str()); }
     std::vector<PoolUse> runs() const {

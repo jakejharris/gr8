@@ -16,6 +16,13 @@ if command -v cargo > /dev/null 2>&1; then
 fi
 [ -f "$KV" ] || { echo "no $KV: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
 KVLIB=("$KV" -lpthread -ldl -lm)
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" -I "$REPO/engine" "$REPO/engine/runtime/tests/steering_test.cpp" \
+  "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
+"$T/steering_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/serve_parse_test.cpp" -o "$T/serve_parse_test"
+"$T/serve_parse_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_state_test.cpp" "${KVLIB[@]}" -o "$T/steering_state_test"
+"$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_round_test.cpp" -o "$T/batch_round_test"
 "$T/batch_round_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflash_test.cpp" -o "$T/batch_dflash_test"

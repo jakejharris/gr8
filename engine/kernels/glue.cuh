@@ -169,11 +169,145 @@ constexpr int RN_CL = 8;                 // CTAs (cluster size) per row
 constexpr int RN_COLS = HID / RN_CL;     // 768 columns per CTA
 constexpr int RN_T = RN_COLS / 8;        // 96 threads, 8 consecutive columns each
 
+// Immutable direction metadata is resident on device. Decode supplies one scale per row through StepIn; tensor
+// prefill supplies the request's one scale by value. Projection is folded into the existing writer consume kernel,
+// before the incoming residual is added, so it introduces no launch, copy, allocation, or graph node.
+struct SteerArgs
+{
+    const float* dir = nullptr;       // [HID], nullptr when this writer/layer is inactive
+    const float* row_scale = nullptr; // [M], decode/S2; nullptr for a uniform prefill request
+    float scale = 0.f;                // uniform prefill scale
+    float alpha = 0.f;                // immutable profile alpha for this layer
+    float norm_sq = 1.f;              // host-precomputed sum(dir^2); avoids a hot-path cluster reduction
+};
+
 __device__ __forceinline__ void bf16x8_to_f(const uint4& v, float (&o)[8])
 {
     const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
     #pragma unroll
     for (int k = 0; k < 8; ++k) o[k] = __bfloat162float(b[k]);
+}
+
+// Project this thread's eight columns of a writer row by y <- y - scale*alpha*r*(r^T y).  All CTAs of a row take
+// the same branch. A zero scale returns before loading the direction and before touching x, which preserves the
+// unsteered writer bits exactly.
+__device__ __forceinline__ void cluster_project(float (&x)[8], const SteerArgs& a, int row, int col0)
+{
+    const float scale = a.row_scale ? a.row_scale[row] : a.scale;
+    if (!a.dir || scale == 0.f || a.alpha == 0.f) return;
+    __shared__ float wsum[RN_T / 32];
+    __shared__ float cta_dot;
+    const float4 r0 = *reinterpret_cast<const float4*>(a.dir + col0);
+    const float4 r1 = *reinterpret_cast<const float4*>(a.dir + col0 + 4);
+    const float r[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+    float dot = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) dot = fmaf(x[k], r[k], dot);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+    if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = dot;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float t = 0.f;
+        #pragma unroll
+        for (int i = 0; i < RN_T / 32; ++i) t += wsum[i];
+        cta_dot = t;
+    }
+    cg::cluster_group cl = cg::this_cluster();
+    cl.sync();
+    float total = 0.f;
+    #pragma unroll
+    for (int i = 0; i < RN_CL; ++i) total += *cl.map_shared_rank(&cta_dot, i);
+    const float kappa = (scale * a.alpha) * total;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) x[k] -= kappa * r[k];
+    cl.sync();
+}
+
+// Enabled writer consume can share the RMS reduction's cluster barriers instead of running cluster_project followed
+// by cluster_rms_store.  With b = residual + y and k = scale*alpha*(r^T y),
+//
+//   ||b - k r||^2 = ||b||^2 - 2 k (b^T r) + k^2 ||r||^2.
+//
+// Reduce the three request-dependent coefficients together, then write the projected residual and its normalized
+// output. The immutable direction norm is computed once at boot, rather than reduced on every token. This is the same
+// rank-one operator in real arithmetic and uses the actual stored direction norm (schema tolerance does not assume it
+// is exactly one). The caller keeps the original stock path for an exact-zero row.
+__device__ __forceinline__ void cluster_project_add_rms_store(
+    float (&y)[8], const SteerArgs& a, int row, int col0, float4* resid, const __nv_bfloat16* w, float eps,
+    __half* out_row, __half* out2_row = nullptr
+#ifdef DEC_SLOT
+    , uint4* o_ret = nullptr
+#endif
+    )
+{
+    enum { DOT_Y, BASE_SS, RESID_DOT, NSTATS };
+    __shared__ float warp_sum[NSTATS][RN_T / 32];
+    __shared__ float cta_sum[NSTATS];
+    const float scale = a.row_scale ? a.row_scale[row] : a.scale;
+    const float4 d0 = *reinterpret_cast<const float4*>(a.dir + col0);
+    const float4 d1 = *reinterpret_cast<const float4*>(a.dir + col0 + 4);
+    const float d[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
+    const float4 q0 = resid[0], q1 = resid[1];
+    const float q[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+    float s[NSTATS] = {0.f, 0.f, 0.f};
+    float base[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k)
+    {
+        base[k] = y[k] + q[k];
+        s[DOT_Y] = fmaf(y[k], d[k], s[DOT_Y]);
+        s[BASE_SS] = fmaf(base[k], base[k], s[BASE_SS]);
+        s[RESID_DOT] = fmaf(q[k], d[k], s[RESID_DOT]);
+    }
+    #pragma unroll
+    for (int z = 0; z < NSTATS; ++z)
+    {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s[z] += __shfl_xor_sync(0xffffffffu, s[z], o);
+        if ((threadIdx.x & 31) == 0) warp_sum[z][threadIdx.x >> 5] = s[z];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+        #pragma unroll
+        for (int z = 0; z < NSTATS; ++z)
+        {
+            float t = 0.f;
+            #pragma unroll
+            for (int i = 0; i < RN_T / 32; ++i) t += warp_sum[z][i];
+            cta_sum[z] = t;
+        }
+    cg::cluster_group cl = cg::this_cluster();
+    cl.sync();
+    float total[NSTATS] = {0.f, 0.f, 0.f};
+    #pragma unroll
+    for (int z = 0; z < NSTATS; ++z)
+        #pragma unroll
+        for (int rank = 0; rank < RN_CL; ++rank) total[z] += *cl.map_shared_rank(&cta_sum[z], rank);
+    const float kappa = (scale * a.alpha) * total[DOT_Y];
+    const float base_dot = total[DOT_Y] + total[RESID_DOT];
+    const float ss = fmaxf(0.f, fmaf(kappa, kappa * a.norm_sq,
+                                     fmaf(-2.f * kappa, base_dot, total[BASE_SS])));
+    const float inv = rsqrtf(ss * (1.f / HID) + eps);
+    uint4 wv = *reinterpret_cast<const uint4*>(w + col0);
+    float wf[8];
+    bf16x8_to_f(wv, wf);
+    uint4 o;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = base[k] - kappa * d[k];
+    resid[0] = make_float4(y[0], y[1], y[2], y[3]);
+    resid[1] = make_float4(y[4], y[5], y[6], y[7]);
+    o.x = pack_h2(y[0] * inv * wf[0], y[1] * inv * wf[1]);
+    o.y = pack_h2(y[2] * inv * wf[2], y[3] * inv * wf[3]);
+    o.z = pack_h2(y[4] * inv * wf[4], y[5] * inv * wf[5]);
+    o.w = pack_h2(y[6] * inv * wf[6], y[7] * inv * wf[7]);
+    *reinterpret_cast<uint4*>(out_row + col0) = o;
+    if (out2_row) *reinterpret_cast<uint4*>(out2_row + col0) = o;
+#ifdef DEC_SLOT
+    if (o_ret) *o_ret = o;
+#endif
+    cl.sync();
 }
 
 // x: this thread's 8 values of row m (columns col0..col0+7). Writes fp16(x * rsqrt(mean(x^2)+eps) * w).
@@ -261,6 +395,7 @@ struct ArNormArgs
     const __nv_bfloat16* w;       // [6144] next norm weight
     __half* out;                  // [M][6144]
     float eps;
+    SteerArgs steer{};
 #ifdef DEC_SLOT
     u32* xf16;                    // nullptr, or the mma B fragment table of out (bind.cuh Xfrag layout, rows >= M zero)
     u32* xbf16;                   //   the same values rounded to BF16 (nullptr: not wanted)
@@ -330,17 +465,35 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
             #pragma unroll
             for (int k = 0; k < 8; ++k) x[k] += b[k];
         }
-    const float4 r0 = r[0], r1 = r[1];
-    x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
-    x[4] += r1.x; x[5] += r1.y; x[6] += r1.z; x[7] += r1.w;
-    r[0] = make_float4(x[0], x[1], x[2], x[3]);
-    r[1] = make_float4(x[4], x[5], x[6], x[7]);
+    const float steer_scale = a.steer.row_scale ? a.steer.row_scale[m] : a.steer.scale;
+    const bool steer = a.steer.dir && steer_scale != 0.f && a.steer.alpha != 0.f;
 #ifdef DEC_SLOT
     uint4 o;
-    cluster_rms_store(x, a.w, a.eps, a.out + (size_t)m * HID, col0, nullptr, &o);
+    if (steer)
+        cluster_project_add_rms_store(x, a.steer, m, col0, r, a.w, a.eps,
+                                      a.out + (size_t)m * HID, nullptr, &o);
+    else
+    {
+        const float4 r0 = r[0], r1 = r[1];
+        x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
+        x[4] += r1.x; x[5] += r1.y; x[6] += r1.z; x[7] += r1.w;
+        r[0] = make_float4(x[0], x[1], x[2], x[3]);
+        r[1] = make_float4(x[4], x[5], x[6], x[7]);
+        cluster_rms_store(x, a.w, a.eps, a.out + (size_t)m * HID, col0, nullptr, &o);
+    }
     if (a.xf16) frag_store(o, col0, m, a.M, a.xf16, a.xbf16);
 #else
-    cluster_rms_store(x, a.w, a.eps, a.out + (size_t)m * HID, col0);
+    if (steer)
+        cluster_project_add_rms_store(x, a.steer, m, col0, r, a.w, a.eps, a.out + (size_t)m * HID);
+    else
+    {
+        const float4 r0 = r[0], r1 = r[1];
+        x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
+        x[4] += r1.x; x[5] += r1.y; x[6] += r1.z; x[7] += r1.w;
+        r[0] = make_float4(x[0], x[1], x[2], x[3]);
+        r[1] = make_float4(x[4], x[5], x[6], x[7]);
+        cluster_rms_store(x, a.w, a.eps, a.out + (size_t)m * HID, col0);
+    }
 #endif
     if (a.f.xt && threadIdx.x == 0)
         atomicMax(reinterpret_cast<unsigned long long*>(xt_rec(a.f, step, a.c) + g6::XT_RED), (unsigned long long)xt_now());
