@@ -12,7 +12,7 @@ from g6front.errors import ApiError  # noqa: E402
 
 
 class SteeringTests(unittest.TestCase):
-    cap = {'profile': 'own-refusal-v1', 'digest': '0' * 64, 'scope': 'full', 'layers': 48,
+    cap = {'profile': 'example', 'digest': '0' * 64, 'scope': 'full', 'layers': 48,
            'forced': False, 'forced_scale': 0.0}
 
     def test_off_and_canonical_zero(self):
@@ -20,9 +20,9 @@ class SteeringTests(unittest.TestCase):
         self.assertEqual(sampling.steering({'steering_scale': -0.0}, self.cap), {})
 
     def test_profile_default_and_fp32_scale(self):
-        self.assertEqual(sampling.steering({'steering_profile': 'own-refusal-v1'}, self.cap),
-                         {'steering_profile': 'own-refusal-v1', 'steering_scale': 1.0})
-        got = sampling.steering({'steering_profile': 'own-refusal-v1', 'steering_scale': 1.1}, self.cap)
+        self.assertEqual(sampling.steering({'steering_profile': 'example'}, self.cap),
+                         {'steering_profile': 'example', 'steering_scale': 1.0})
+        got = sampling.steering({'steering_profile': 'example', 'steering_scale': 1.1}, self.cap)
         self.assertNotEqual(got['steering_scale'], 1.1)  # canonical IEEE-754 binary32 value
 
     def test_rejections(self):
@@ -31,8 +31,8 @@ class SteeringTests(unittest.TestCase):
             ({'steering_profile': 7}, 'steering_profile'),
             ({'steering_profile': 'bad/name'}, 'steering_profile'),
             ({'steering_scale': 1}, 'steering_scale'),
-            ({'steering_profile': 'own-refusal-v1', 'steering_scale': math.inf}, 'steering_scale'),
-            ({'steering_profile': 'own-refusal-v1', 'steering_scale': 4.1}, 'steering_scale'),
+            ({'steering_profile': 'example', 'steering_scale': math.inf}, 'steering_scale'),
+            ({'steering_profile': 'example', 'steering_scale': 4.1}, 'steering_scale'),
         ]
         for body, param in cases:
             with self.subTest(body=body):
@@ -44,9 +44,17 @@ class SteeringTests(unittest.TestCase):
         cap = dict(self.cap, forced=True, forced_scale=2.0)
         self.assertEqual(sampling.steering({}, cap), {})
         with self.assertRaises(ApiError):
-            sampling.steering({'steering_profile': 'own-refusal-v1'}, cap)
-        self.assertEqual(sampling.steering({'steering_profile': 'own-refusal-v1', 'steering_scale': 2}, cap),
-                         {'steering_profile': 'own-refusal-v1', 'steering_scale': 2.0})
+            sampling.steering({'steering_profile': 'example'}, cap)
+        self.assertEqual(sampling.steering({'steering_profile': 'example', 'steering_scale': 2}, cap),
+                         {'steering_profile': 'example', 'steering_scale': 2.0})
+
+    def test_profile_on_a_server_without_steering_is_clear(self):
+        for cap in (None, {}):
+            with self.assertRaises(ApiError) as e:
+                sampling.steering({'steering_profile': 'example'}, cap)
+            self.assertEqual(e.exception.param, 'steering_profile')
+            self.assertEqual(str(e.exception),
+                             'steering is not enabled on this server (start it with --steering-profile)')
 
 
 if __name__ == '__main__':

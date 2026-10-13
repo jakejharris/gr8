@@ -240,14 +240,12 @@ class Release:
     def id(self):
         return f'{self.repo.repo}@{self.commit}'
 
-    def fetch_meta(self):
-        """The manifests and the tokenizer and config files. Once there, a boot needs no network for them."""
+    def fetch_meta(self, steering=None):
+        """The manifests and tokenizer/config files, plus the named steering profile only when explicitly selected."""
         done = os.path.join(self.dir, 'meta.json')
         if os.path.isfile(done):
-            self._load_cached_steering()
-            meta = load_json(done) or {}
-            if STEERING_INDEX in meta.get('files', []) and self.steering_profile is None:
-                self._fetch_steering(self.repo.tree())
+            if steering:
+                self._fetch_steering(self.repo.tree(), steering)
             return
         t = self.repo.tree()
         for p in sorted(t):
@@ -258,24 +256,25 @@ class Release:
             raise modelset.ModelError(f'{self} lacks {", ".join(missing)} at its root')
         for name in META_FILES:
             self.repo.fetch(name, os.path.join(self.tokenizer, name))
-        steering_files = self._fetch_steering(t)
         with open(done + '.tmp', 'w') as f:
-            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': list(META_FILES) + steering_files}, f,
-                      indent=1)
+            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': list(META_FILES)}, f, indent=1)
         os.replace(done + '.tmp', done)
+        if steering:
+            self._fetch_steering(t, steering)
 
-    def _fetch_steering(self, tree):
-        """Fetch and materialize the optional default steering profile. A release without it behaves as before."""
+    def _fetch_steering(self, tree, requested):
+        """Fetch and materialize one explicitly selected profile from this release."""
         if STEERING_INDEX not in tree:
-            return []
+            raise modelset.ModelError(f'{self}: --steering-profile hf:{requested} needs {STEERING_INDEX}')
         index_path = os.path.join(self.dir, STEERING_INDEX)
         self.repo.fetch(STEERING_INDEX, index_path)
         try:
-            with open(index_path) as f:
-                index = json.load(f)
+            with open(index_path, 'rb') as f:
+                index = steering_release.parse_json(f.read(), 'steering index JSON')
         except (OSError, ValueError) as e:
             raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid JSON ({e})') from None
-        if set(index) != {'schema_version', 'default_profile', 'profiles'} or index['schema_version'] != 1 or \
+        if not isinstance(index, dict) or set(index) != {'schema_version', 'default_profile', 'profiles'} or \
+                type(index['schema_version']) is not int or index['schema_version'] != 1 or \
                 not isinstance(index['profiles'], list):
             raise modelset.ModelError(f'{self} {STEERING_INDEX}: want schema_version 1, default_profile and profiles')
         by_name = {}
@@ -283,42 +282,32 @@ class Release:
             if not isinstance(rec, dict) or set(rec) != {'name', 'file', 'sha256', 'byte_count'}:
                 raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid profile record')
             name, path = rec['name'], rec['file']
-            if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name) or name in by_name:
+            if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name) or name in by_name:
                 raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid or duplicate profile name')
             if path != f'steering/{name}.safetensors' or path not in tree or \
                     not re.fullmatch(r'[0-9a-f]{64}', str(rec['sha256'])) or \
-                    not isinstance(rec['byte_count'], int) or rec['byte_count'] <= 0:
+                    type(rec['byte_count']) is not int or rec['byte_count'] <= 0:
                 raise modelset.ModelError(f'{self} {STEERING_INDEX}: invalid profile file record for {name}')
             by_name[name] = rec
         default = index['default_profile']
         if default not in by_name:
             raise modelset.ModelError(f'{self} {STEERING_INDEX}: default_profile is not listed')
-        rec = by_name[default]
+        name = default if requested == 'default' else requested
+        if name not in by_name:
+            raise modelset.ModelError(f'{self} {STEERING_INDEX}: no steering profile named {name!r}')
+        rec = by_name[name]
         artifact = os.path.join(self.dir, rec['file'])
         self.repo.fetch(rec['file'], artifact)
         if os.path.getsize(artifact) != rec['byte_count'] or modelset.sha256_file(artifact) != rec['sha256']:
             raise modelset.ModelError(f'{self} {rec["file"]}: index size or digest mismatch')
-        out = os.path.join(self.dir, 'steering', 'profiles', default)
+        out = os.path.join(self.dir, 'steering', 'profiles', name)
         try:
             manifest = steering_release.unpack(artifact, out)
         except (OSError, steering_release.ProfileError) as e:
             raise modelset.ModelError(f'{self} {rec["file"]}: {e}') from None
-        if manifest.get('profile_name') != default:
+        if manifest.get('profile_name') != name:
             raise modelset.ModelError(f'{self} {rec["file"]}: embedded profile name differs from the index')
         self.steering_profile = (out, manifest)
-        return [STEERING_INDEX, rec['file']]
-
-    def _load_cached_steering(self):
-        index = load_json(os.path.join(self.dir, STEERING_INDEX))
-        if not index:
-            return
-        name = index.get('default_profile')
-        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name):
-            return
-        out = os.path.join(self.dir, 'steering', 'profiles', str(name))
-        manifest = load_json(os.path.join(out, 'manifest.json'))
-        if manifest:
-            self.steering_profile = (out, manifest)
 
     def whole_files(self, tp, rank):
         """The release files this rank loads whole: its index slices, and the dense and vocab files."""

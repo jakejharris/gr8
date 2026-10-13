@@ -8,7 +8,7 @@ static int fails = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); ++fails; } } while (0)
 
 static st::BootConfig boot() {
-    st::BootConfig b; b.loaded = true; b.profile_name = "own-refusal-v1"; b.scope = st::Scope::Full;
+    st::BootConfig b; b.loaded = true; b.profile_name = "example"; b.scope = st::Scope::Full;
     for (unsigned i=0;i<32;++i) { b.profile_digest[i]=uint8_t(i); b.schedule_digest[i]=uint8_t(63-i); }
     return b;
 }

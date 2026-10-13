@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -12,11 +13,17 @@ from steering import release
 
 class ReleaseTests(unittest.TestCase):
     def fixture(self, root):
-        payload = b'\0\0\x80?' * 6
+        payload = struct.pack('<6f', 1, 0, 0, 0, 1, 0)
         manifest = {'schema_version': 1, 'profile_name': 'test-v1',
-                    'model': {'hidden_size': 3}, 'layers': [1, 2], 'alphas': [1.0, 1.0],
+                    'model': {'name': 'glm-5.3', 'revision': 'rev', 'weight_set': 'a' * 64,
+                              'tokenizer_revision': 'tok', 'chat_template_sha256': 'b' * 64,
+                              'hidden_size': 3, 'layer_count': 5},
+                    'scope': 'full', 'layers': [1, 2], 'alphas': [1.0, 1.0],
                     'directions': {'file': 'directions.f32', 'dtype': 'float32-le', 'byte_count': len(payload),
-                                   'sha256': hashlib.sha256(payload).hexdigest()}}
+                                   'sha256': hashlib.sha256(payload).hexdigest()},
+                    'provenance': {'extraction_tool': 'fixture', 'extraction_commit': 'fixture',
+                                   'dataset_manifests': {'train': '1' * 64, 'validation': '2' * 64,
+                                                         'final': '3' * 64}}}
         with open(os.path.join(root, 'manifest.json'), 'w') as f: json.dump(manifest, f)
         with open(os.path.join(root, 'directions.f32'), 'wb') as f: f.write(payload)
         return manifest, payload
@@ -30,6 +37,7 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(fa.read(), fb.read())
             got = release.unpack(a, out)
             self.assertEqual(got, manifest)
+            self.assertEqual(release.validate_directory(out, manifest['model']), manifest)
             with open(os.path.join(out, 'directions.f32'), 'rb') as f:
                 self.assertEqual(f.read(), payload)
 
@@ -41,6 +49,19 @@ class ReleaseTests(unittest.TestCase):
             bad = os.path.join(d, 'bad.safetensors')
             with open(bad, 'wb') as f: f.write(raw)
             with self.assertRaises(release.ProfileError): release.read(bad)
+
+    def test_directory_validation_rejects_identity_and_non_unit_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest, _ = self.fixture(d)
+            with self.assertRaisesRegex(release.ProfileError, 'model identity mismatch'):
+                release.validate_directory(d, dict(manifest['model'], revision='other'))
+            with open(os.path.join(d, 'directions.f32'), 'wb') as f:
+                f.write(struct.pack('<6f', 1, 1, 0, 0, 1, 0))
+            manifest['directions']['sha256'] = hashlib.sha256(struct.pack('<6f', 1, 1, 0, 0, 1, 0)).hexdigest()
+            with open(os.path.join(d, 'manifest.json'), 'w') as f:
+                json.dump(manifest, f)
+            with self.assertRaisesRegex(release.ProfileError, 'direction norm'):
+                release.validate_directory(d)
 
 
 if __name__ == '__main__': unittest.main()

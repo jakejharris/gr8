@@ -101,7 +101,7 @@ KEYS = {
     'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
-    'STEERING_PROFILE': ('box', None, 'directory containing a schema-v1 manifest.json and directions.f32'),
+    'STEERING_PROFILE': ('box', None, 'schema-v1 profile directory, or hf:default / hf:NAME from an HF release'),
     'STEERING_FORCE': ('cluster', None, 'force the loaded steering profile at this request scale'),
     'STEERING_MODEL_REVISION': ('cluster', None, 'exact model revision recorded by the steering profile'),
     'STEERING_TOKENIZER_REVISION': ('cluster', None, 'exact tokenizer revision recorded by the steering profile'),
@@ -260,8 +260,9 @@ def parse(argv, environ=None):
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
               'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE'):
-        if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or (k == 'VARIANT' and '/' not in values[k]
-                                                                               and not values[k].endswith('.json')):
+        if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
+                (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
+                (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
             continue
         values[k] = os.path.abspath(values[k])   # the engine runs in G6_HOME
     return opts
@@ -319,16 +320,20 @@ def validate(o):
     if o.get('STEERING_FORCE') and not steering:
         raise OptionError('--steering-force needs --steering-profile')
     if steering:
-        missing = [flag_of(k) for k in ('STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION',
-                                        'STEERING_CHAT_TEMPLATE_SHA256') if not o.get(k)]
-        if missing:
-            raise OptionError('--steering-profile needs ' + ', '.join(missing))
-        digest = o.get('STEERING_CHAT_TEMPLATE_SHA256')
-        if not re.fullmatch(r'[0-9a-f]{64}', digest):
-            raise OptionError('--steering-chat-template-sha256: want 64 lowercase hex digits')
-        weight_set = o.get('STEERING_WEIGHT_SET')
-        if weight_set and not re.fullmatch(r'[0-9a-f]{64}', weight_set):
-            raise OptionError('--steering-weight-set: want 64 lowercase hex digits')
+        bundled = steering.startswith('hf:')
+        if bundled and steering != 'hf:default' and not re.fullmatch(r'hf:[A-Za-z0-9][A-Za-z0-9._-]{0,127}', steering):
+            raise OptionError('--steering-profile: want a profile directory, hf:default, or hf:NAME')
+        if not bundled:
+            missing = [flag_of(k) for k in ('STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION',
+                                            'STEERING_CHAT_TEMPLATE_SHA256') if not o.get(k)]
+            if missing:
+                raise OptionError('--steering-profile needs ' + ', '.join(missing))
+            digest = o.get('STEERING_CHAT_TEMPLATE_SHA256')
+            if not re.fullmatch(r'[0-9a-f]{64}', digest):
+                raise OptionError('--steering-chat-template-sha256: want 64 lowercase hex digits')
+            weight_set = o.get('STEERING_WEIGHT_SET')
+            if weight_set and not re.fullmatch(r'[0-9a-f]{64}', weight_set):
+                raise OptionError('--steering-weight-set: want 64 lowercase hex digits')
         if o.get('STEERING_FORCE'):
             try:
                 force = float(o.get('STEERING_FORCE'))

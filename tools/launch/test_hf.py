@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -102,13 +103,15 @@ def make_release(root):
         put(f'dense/{name}.safetensors', rnd.bytes(300_000))
     for name in hfsource.META_FILES:
         put(name, f'{{"{name}": 1}}'.encode())
-    directions = b'\0\0\x80?' * 8
+    hidden = 6144
+    directions = struct.pack(f'<{hidden * 2}f', *([1.0] + [0.0] * (hidden - 1) +
+                                                   [0.0, 1.0] + [0.0] * (hidden - 2)))
     steering_manifest = {
         'schema_version': 1, 'profile_name': 'test-default',
         'model': {'name': 'glm-5.3', 'revision': 'base-rev', 'weight_set': '5e' * 32,
                   'tokenizer_revision': 'base-rev',
                   'chat_template_sha256': hashlib.sha256(b'{"chat_template.jinja": 1}').hexdigest(),
-                  'hidden_size': 4, 'layer_count': 78},
+                  'hidden_size': hidden, 'layer_count': 78},
         'scope': 'shared', 'layers': [2, 3], 'alphas': [1.0, 1.0],
         'directions': {'file': 'directions.f32', 'dtype': 'float32-le', 'byte_count': len(directions),
                        'sha256': hashlib.sha256(directions).hexdigest()},
@@ -263,9 +266,9 @@ class HFTests(unittest.TestCase):
         self.env.stop()
         self.hub.close()
 
-    def release(self, rev='main', refresh=False):
+    def release(self, rev='main', refresh=False, steering=None):
         r = hfsource.Release(self.cache, RELEASE, rev, refresh=refresh, log=self.logs.append)
-        r.fetch_meta()
+        r.fetch_meta(steering)
         return r
 
     def variant(self, r, name='home'):
@@ -345,7 +348,8 @@ class HFTests(unittest.TestCase):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0',
+                       '--steering-profile', 'hf:default'], {})
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -362,6 +366,32 @@ class HFTests(unittest.TestCase):
         self.assertEqual(o.get('STEERING_MODEL_REVISION'), 'base-rev')
         self.assertIn('--steering-weight-set', plan['args'])
 
+    def test_plain_hf_model_ignores_bundled_steering(self):
+        import options as opt
+        import supervisor as S
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], {})
+        opt.validate(o)
+        ms, _, err = S.resolve_model(o, log=self.logs.append)
+        self.assertEqual(err, '')
+        self.assertIsNone(o.get('STEERING_PROFILE'))
+        self.assertIsNone(ms.release.steering_profile)
+        self.assertFalse(self.hub.requests(r'/steering/'))
+
+    def test_missing_local_profile_stops_model_resolution(self):
+        import options as opt
+        import supervisor as S
+        missing = os.path.join(self.cache, 'not-a-profile')
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0',
+                       '--steering-profile', missing, '--steering-model-revision', 'base-rev',
+                       '--steering-tokenizer-revision', 'base-rev', '--steering-chat-template-sha256',
+                       hashlib.sha256(b'{"chat_template.jinja": 1}').hexdigest()], {})
+        opt.validate(o)
+        _, _, err = S.resolve_model(o, log=self.logs.append)
+        self.assertIn('--steering-profile', err)
+        self.assertIn('manifest.json', err)
+
     def test_release_without_steering_still_works(self):
         plain = shutil.copytree(self.r1, os.path.join(self.cache, 'plain'))
         shutil.rmtree(os.path.join(plain, 'steering'))
@@ -369,6 +399,18 @@ class HFTests(unittest.TestCase):
         self.hub.repos[RELEASE][c] = plain
         r = self.release(c)
         self.assertIsNone(r.steering_profile)
+
+    def test_bundled_steering_is_ignored_until_explicitly_selected(self):
+        r = self.release()
+        self.assertIsNone(r.steering_profile)
+        self.assertFalse(self.hub.requests(r'/steering/'))
+        r.fetch_meta('default')
+        self.assertEqual(r.steering_profile[1]['profile_name'], 'test-default')
+        self.assertTrue(self.hub.requests(r'/steering/index\.json'))
+
+    def test_unknown_bundled_profile_is_named(self):
+        with self.assertRaisesRegex(modelset.ModelError, "no steering profile named 'missing'"):
+            self.release(steering='missing')
 
     def test_commit_is_recorded_and_refreshed(self):
         r = self.release()

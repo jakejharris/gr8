@@ -68,6 +68,12 @@ pub fn steering(
         return Ok((None, None));
     }
     let loaded = capability.and_then(|c| c.get("profile")).and_then(Value::as_str);
+    if loaded.is_none() {
+        return Err(ApiError::bad(
+            "steering is not enabled on this server (start it with --steering-profile)",
+            Some("steering_profile"),
+        ));
+    }
     if loaded != profile.as_deref() {
         return Err(ApiError::bad("unknown steering_profile", Some("steering_profile")));
     }
@@ -418,10 +424,10 @@ mod tests {
 
     #[test]
     fn steering_is_canonical_and_checked_against_hello() {
-        let cap = serde_json::json!({"profile":"own-refusal-v1","forced":false,"forced_scale":0.0});
-        let body = serde_json::json!({"steering_profile":"own-refusal-v1","steering_scale":1.1});
+        let cap = serde_json::json!({"profile":"example","forced":false,"forced_scale":0.0});
+        let body = serde_json::json!({"steering_profile":"example","steering_scale":1.1});
         let (p, s) = steering(body.as_object().unwrap(), Some(&cap)).unwrap();
-        assert_eq!(p.as_deref(), Some("own-refusal-v1"));
+        assert_eq!(p.as_deref(), Some("example"));
         assert_eq!(s, Some((1.1f32) as f64));
         let zero = serde_json::json!({"steering_scale":-0.0});
         assert_eq!(steering(zero.as_object().unwrap(), Some(&cap)).unwrap(), (None, None));
@@ -435,7 +441,10 @@ mod tests {
             steering(malformed.as_object().unwrap(), Some(&cap)).unwrap_err().message,
             "steering_profile must be a profile name"
         );
-        let forced = serde_json::json!({"profile":"own-refusal-v1","forced":true,"forced_scale":2.0});
+        let disabled = steering(body.as_object().unwrap(), None).unwrap_err();
+        assert_eq!(disabled.param.as_deref(), Some("steering_profile"));
+        assert_eq!(disabled.message, "steering is not enabled on this server (start it with --steering-profile)");
+        let forced = serde_json::json!({"profile":"example","forced":true,"forced_scale":2.0});
         assert!(steering(body.as_object().unwrap(), Some(&forced)).is_err());
     }
 }

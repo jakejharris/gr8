@@ -185,9 +185,9 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 - `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 415,232 against
   310,528) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
-- `--steering-profile DIR` loads a schema-v1 profile. Requests select it with `steering_profile` and
-  `steering_scale`; `--steering-force SCALE` is the process-wide qualification mode. A model release can bundle a
-  default profile under `steering/`; GR8 verifies and discovers it automatically while keeping steering off by default.
+- `--steering-profile DIR` loads a local schema-v1 profile; with an HF model, `hf:default` or `hf:NAME` explicitly
+  selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select the loaded profile with
+  `steering_profile` and `steering_scale`; `--steering-force SCALE` is the process-wide qualification mode.
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
 
@@ -270,10 +270,6 @@ place the model is built in, and what would carry over to another model.
 - [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw), whose
   per-expert bit distribution `home` keeps expert for expert.
 - [RigMark](https://github.com/alexellis/rigmark) by alexellis, for the decode and concurrency numbers above.
-- [JSPARK Ablit](https://huggingface.co/jakejharris/jspark-ablit-glm-5.3-exlr8-k2-k3-k4), for the optional per-request
-  activation steering integration and the experimental `ablit-behavior-v1` profile. Its model card credits the upstream
-  model and profile sources, including drowzeys and Blackfrost Research. See also
-  [profile provenance and licensing](docs/STEERING.md#profile-provenance-and-licensing).
 - The tool-call cases in `frontend/tests/test_parser.py` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 ## License

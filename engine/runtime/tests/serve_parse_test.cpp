@@ -30,9 +30,9 @@ int main()
     CHECK(r.n_gen == 4 && r.stop.empty() && r.top_p == 0.f && r.prompt == std::vector<int>{7});
     CHECK(refused("n_gen 4 temp 0 seed 1 min 0 stop - lp 99\n7\n")); // steering release rejects out-of-range fields
 
-    steering::BootConfig sb; sb.loaded = true; sb.profile_name = "own-refusal-v1";
+    steering::BootConfig sb; sb.loaded = true; sb.profile_name = "example";
     sb.scope = steering::Scope::Full; sb.profile_digest[0] = 1; sb.schedule_digest[0] = 2;
-    ServeReq sr; serve_parse("n_gen 4 temp 0 seed 1 min 0 stop - steer own-refusal-v1 3f800000\n7\n", V, sr, sb);
+    ServeReq sr; serve_parse("n_gen 4 temp 0 seed 1 min 0 stop - steer example 3f800000\n7\n", V, sr, sb);
     CHECK(sr.n_gen == 4 && sr.steering.enabled && steering::bits_float(sr.steering.scale_bits) == 1.0f);
     serve_parse("n_gen 4 temp 0 seed 1 min 0 stop - steer other 3f800000\n7\n", V, sr, sb);
     CHECK(sr.n_gen == 0);

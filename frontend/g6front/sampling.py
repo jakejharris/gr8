@@ -34,7 +34,10 @@ def steering(body: dict, capability: dict | None) -> dict:
         if capability and capability.get('forced'):
             raise ApiError('request steering conflicts with forced mode', param='steering_scale')
         return {}                    # scale-only canonical zero normalizes to off
-    if not capability or profile != capability.get('profile'):
+    if not capability or not capability.get('profile'):
+        raise ApiError('steering is not enabled on this server (start it with --steering-profile)',
+                       param='steering_profile')
+    if profile != capability.get('profile'):
         raise ApiError('unknown steering_profile', param='steering_profile')
     if capability.get('forced') and scale != capability.get('forced_scale'):
         raise ApiError('request steering conflicts with forced mode', param='steering_scale')

@@ -8,6 +8,7 @@ materialize a downloaded profile before any model dependencies are installed.
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -29,34 +30,140 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def validate_manifest(manifest, payload):
-    if not isinstance(manifest, dict) or manifest.get('schema_version') != 1:
+def _unique_object(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ProfileError(f'duplicate JSON key {key}')
+        out[key] = value
+    return out
+
+
+def parse_json(raw, where):
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ProfileError(f'invalid {where}: {e}') from None
+
+
+def read_limited(path, limit, what):
+    with open(path, 'rb') as f:
+        raw = f.read(limit + 1)
+    if len(raw) > limit:
+        raise ProfileError(f'{what} is too large')
+    return raw
+
+
+def _object(value, keys, where):
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise ProfileError(f'invalid {where}')
+
+
+def _integer(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_manifest(manifest, payload, expected=None):
+    _object(manifest, ('schema_version', 'profile_name', 'model', 'scope', 'layers', 'alphas', 'directions',
+                       'provenance'), 'manifest fields')
+    if not _integer(manifest.get('schema_version')) or manifest['schema_version'] != 1:
         raise ProfileError('want a schema-v1 steering manifest')
     name = manifest.get('profile_name')
-    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name):
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name):
         raise ProfileError('invalid profile_name')
     layers, alphas = manifest.get('layers'), manifest.get('alphas')
     model, directions = manifest.get('model'), manifest.get('directions')
     if not isinstance(layers, list) or not layers or not isinstance(alphas, list) or len(layers) != len(alphas):
         raise ProfileError('inconsistent layers and alphas')
-    if not isinstance(model, dict) or not isinstance(model.get('hidden_size'), int) or model['hidden_size'] <= 0:
-        raise ProfileError('invalid model.hidden_size')
+    _object(model, ('name', 'revision', 'weight_set', 'tokenizer_revision', 'chat_template_sha256', 'hidden_size',
+                    'layer_count'), 'model fields')
+    for field in ('name', 'revision', 'weight_set', 'tokenizer_revision'):
+        if not isinstance(model.get(field), str) or not model[field]:
+            raise ProfileError(f'invalid model.{field}')
+    if not re.fullmatch(r'[0-9a-f]{64}', model['weight_set']):
+        raise ProfileError('invalid model.weight_set')
+    if not _integer(model.get('hidden_size')) or model['hidden_size'] <= 0 or \
+            not _integer(model.get('layer_count')) or model['layer_count'] <= 0:
+        raise ProfileError('invalid model dimensions')
+    if not re.fullmatch(r'[0-9a-f]{64}', str(model.get('chat_template_sha256'))):
+        raise ProfileError('invalid model.chat_template_sha256')
+    if expected and any(model.get(key) != value for key, value in expected.items()):
+        raise ProfileError('model identity mismatch')
+    last = -1
+    for layer in layers:
+        if not _integer(layer) or layer <= last or layer >= model['layer_count']:
+            raise ProfileError('layers must be unique, ordered, and in range')
+        last = layer
+    for alpha in alphas:
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha) or \
+                not 0.0 <= alpha <= 4.0:
+            raise ProfileError('alpha must be finite and in [0, 4]')
+    if manifest.get('scope') not in ('shared', 'full'):
+        raise ProfileError('unknown scope')
     want = len(layers) * model['hidden_size'] * 4
-    if not isinstance(directions, dict) or directions.get('file') != 'directions.f32' or \
+    _object(directions, ('file', 'dtype', 'byte_count', 'sha256'), 'directions record')
+    if directions.get('file') != 'directions.f32' or \
             directions.get('dtype') != 'float32-le' or directions.get('byte_count') != want:
         raise ProfileError('invalid directions record')
     if len(payload) != want or len(payload) > MAX_PAYLOAD:
         raise ProfileError('directions payload size mismatch')
     if directions.get('sha256') != sha256(payload):
         raise ProfileError('directions payload digest mismatch')
+    provenance = manifest.get('provenance')
+    if not isinstance(provenance, dict) or not set(provenance).issubset({
+            'extraction_tool', 'extraction_commit', 'dataset_manifests', 'capture_manifest_sha256', 'fit_sha256',
+            'family', 'direction_layer'}) or \
+            not {'extraction_tool', 'extraction_commit', 'dataset_manifests'} <= set(provenance):
+        raise ProfileError('invalid provenance fields')
+    if not isinstance(provenance['extraction_tool'], str) or not provenance['extraction_tool'] or \
+            not isinstance(provenance['extraction_commit'], str) or not provenance['extraction_commit']:
+        raise ProfileError('missing extraction provenance')
+    datasets = provenance['dataset_manifests']
+    _object(datasets, ('train', 'validation', 'final'), 'provenance.dataset_manifests')
+    for field, value in datasets.items():
+        if not re.fullmatch(r'[0-9a-f]{64}', str(value)):
+            raise ProfileError(f'invalid provenance.dataset_manifests.{field}')
+    for field in ('capture_manifest_sha256', 'fit_sha256'):
+        if field in provenance and not re.fullmatch(r'[0-9a-f]{64}', str(provenance[field])):
+            raise ProfileError(f'invalid provenance.{field}')
+    if provenance.get('family') not in (None, 'global-band', 'per-layer'):
+        raise ProfileError('unknown provenance.family')
+    direction_layer = provenance.get('direction_layer')
+    if direction_layer is not None and \
+            (not _integer(direction_layer) or not 0 <= direction_layer < model['layer_count']):
+        raise ProfileError('invalid provenance.direction_layer')
+    values = struct.iter_unpack('<f', payload)
+    width = model['hidden_size']
+    norm2 = 0.0
+    for i, (value,) in enumerate(values, 1):
+        if not math.isfinite(value):
+            raise ProfileError('non-finite direction')
+        norm2 += value * value
+        if i % width == 0:
+            norm = math.sqrt(norm2)
+            if not 0.999 <= norm <= 1.001:
+                raise ProfileError('direction norm outside [0.999, 1.001]')
+            norm2 = 0.0
     return name, [len(layers), model['hidden_size']]
 
 
+def validate_directory(profile_dir, expected=None):
+    """Validate a materialized profile exactly as boot will, before any engine starts."""
+    manifest_path = os.path.join(profile_dir, 'manifest.json')
+    payload_path = os.path.join(profile_dir, 'directions.f32')
+    try:
+        manifest = parse_json(read_limited(manifest_path, MAX_HEADER, 'manifest'), 'manifest JSON')
+        payload = read_limited(payload_path, MAX_PAYLOAD, 'directions payload')
+    except OSError as e:
+        raise ProfileError(str(e)) from None
+    validate_manifest(manifest, payload, expected)
+    return manifest
+
+
 def pack(profile_dir, output):
-    with open(os.path.join(profile_dir, 'manifest.json'), encoding='utf-8') as f:
-        manifest = json.load(f)
-    with open(os.path.join(profile_dir, 'directions.f32'), 'rb') as f:
-        payload = f.read(MAX_PAYLOAD + 1)
+    manifest = parse_json(read_limited(os.path.join(profile_dir, 'manifest.json'), MAX_HEADER, 'manifest'),
+                          'manifest JSON')
+    payload = read_limited(os.path.join(profile_dir, 'directions.f32'), MAX_PAYLOAD, 'directions payload')
     _, shape = validate_manifest(manifest, payload)
     manifest_json = canonical(manifest)
     header = {
@@ -88,10 +195,7 @@ def read(path):
         n, = struct.unpack('<Q', raw)
         if n <= 0 or n > MAX_HEADER or 8 + n > size:
             raise ProfileError('invalid safetensors header length')
-        try:
-            header = json.loads(f.read(n))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise ProfileError(f'invalid safetensors header: {e}') from None
+        header = parse_json(f.read(n), 'safetensors header')
         if set(header) != {'__metadata__', 'directions'}:
             raise ProfileError('want exactly one directions tensor')
         meta, tensor = header['__metadata__'], header['directions']
@@ -103,10 +207,7 @@ def read(path):
         if not isinstance(offsets, list) or offsets != [0, size - 8 - n] or offsets[1] > MAX_PAYLOAD:
             raise ProfileError('invalid directions data offsets')
         payload = f.read()
-    try:
-        manifest = json.loads(meta['gr8_manifest'])
-    except json.JSONDecodeError as e:
-        raise ProfileError(f'invalid embedded manifest: {e}') from None
+    manifest = parse_json(meta['gr8_manifest'], 'embedded manifest')
     manifest_json = canonical(manifest)
     if meta.get('gr8_manifest') != manifest_json or meta.get('manifest_sha256') != sha256(manifest_json.encode()):
         raise ProfileError('embedded manifest is not canonical or has the wrong digest')

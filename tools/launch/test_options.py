@@ -389,10 +389,16 @@ class SteeringOptionTests(unittest.TestCase):
         changed = self.opts(*self.steering(force='2'))
         self.assertNotEqual(digest, opt.canonical(changed, opt.engine_plan(changed), members)[2])
 
+    def test_hf_profile_selector_stays_a_selector_and_needs_no_manual_identity(self):
+        o = self.opts('--steering-profile', 'hf:default')
+        self.assertEqual(o.get('STEERING_PROFILE'), 'hf:default')
+        self.opts('--steering-profile', 'hf:example', '--steering-force', '1')
+
     def test_refusals(self):
         bad = [
             (['--steering-force', '1'], '--steering-force needs'),
             (['--steering-profile', '/p'], '--steering-profile needs'),
+            (['--steering-profile', 'hf:bad/name'], 'hf:NAME'),
             (self.steering()[:6], '--steering-profile needs'),
             (self.steering()[:7] + ['A' * 64] + self.steering()[8:], '64 lowercase hex'),
             (self.steering()[:-1] + ['A' * 64], '--steering-weight-set'),

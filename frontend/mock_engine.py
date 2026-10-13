@@ -40,7 +40,7 @@ PROSE = ('The harbor lay quiet under a pale morning sky, and the old keeper walk
          'as he had done for thirty years. Gulls turned over the water, the tide pulled at the pilings, and the '
          'town behind him woke slowly, one lamp and one chimney at a time. ')
 ACCEPT_CYCLE = [3, 2, 3, 1, 0, 2, 3, 3, 1, 2]  # accepted drafts per round (k=3)
-STEERING = {'profile': 'own-refusal-v1', 'digest': 'a' * 64, 'scope': 'full', 'layers': 48,
+STEERING = {'profile': 'example', 'digest': 'a' * 64, 'scope': 'full', 'layers': 48,
             'forced': False, 'forced_scale': 0.0}
 K_DRAFT = 3
 

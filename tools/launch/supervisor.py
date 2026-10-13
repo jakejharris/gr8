@@ -26,6 +26,7 @@ import hfsource
 import mentat
 import modelset
 import options as opt
+from steering import release as steering_release
 
 REPO = opt.REPO
 # What the engine gets from the supervisor's environment, besides the plan's own variables.
@@ -141,12 +142,16 @@ def resolve_model(o, refresh=False, log=log):
     try:
         model = o.get('MODEL')
         hf = hfsource.parse_url(model)
+        steering_arg = o.get('STEERING_PROFILE')
+        steering_hf = steering_arg[3:] if steering_arg and steering_arg.startswith('hf:') else None
         if hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
             release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
-            release.fetch_meta()
+            if steering_hf and o.get('BASE_PACKS'):
+                raise modelset.ModelError('--steering-profile hf:... cannot be combined with --base-packs')
+            release.fetch_meta(steering_hf)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             if o.get('BASE_PACKS'):
                 model = o.get('BASE_PACKS')
@@ -160,37 +165,49 @@ def resolve_model(o, refresh=False, log=log):
             o.values['V2_SLICES'] = o.get('V2_SLICES') or os.path.join(model, 'index-slices')
             o.values['V2_DENSE'] = model
             ms = modelset.release_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif steering_hf:
+            raise modelset.ModelError('--steering-profile hf:... needs an https://huggingface.co/<org>/<repo> model')
         if ms is None:
             ms = modelset.resolve(model, o.get('MODEL_CACHE'), int(o.get('TP')),
                                   o.get('MODEL_DIR') or (release.tokenizer if release else None))
             if release:
                 ms.source = f'{release}, base packs {ms.source}'
-        if release and release.steering_profile and not o.get('STEERING_PROFILE') and not o.get('BASE_PACKS'):
+        if release and release.steering_profile:
             profile_dir, manifest = release.steering_profile
             identity = manifest.get('model', {})
             weights = ms.set.get('source', {}).get('weights')
             template = os.path.join(ms.tokenizer, 'chat_template.jinja')
             if identity.get('weight_set') != weights:
-                raise modelset.ModelError(f'{release}: default steering profile is for a different weight set')
+                raise modelset.ModelError(f'{release}: steering profile is for a different weight set')
             if identity.get('chat_template_sha256') != opt.file_sha256(template):
-                raise modelset.ModelError(f'{release}: default steering profile is for a different chat template')
+                raise modelset.ModelError(f'{release}: steering profile is for a different chat template')
             fields = {'STEERING_PROFILE': profile_dir, 'STEERING_MODEL_REVISION': identity.get('revision'),
                       'STEERING_TOKENIZER_REVISION': identity.get('tokenizer_revision'),
                       'STEERING_CHAT_TEMPLATE_SHA256': identity.get('chat_template_sha256'),
                       'STEERING_WEIGHT_SET': identity.get('weight_set')}
             if not all(fields.values()):
-                raise modelset.ModelError(f'{release}: default steering profile lacks model identity fields')
+                raise modelset.ModelError(f'{release}: steering profile lacks model identity fields')
             for key, value in fields.items():
                 o.values[key] = value
-            log(f'{release}: default steering profile {manifest.get("profile_name")} is available on request')
+            log(f'{release}: steering profile {manifest.get("profile_name")} selected by the operator')
         ms.release = release
-        ms.drafter = drafter_of(o, ms, refresh, log)
         search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
                               release.dir if release else None) if d and os.path.isdir(d)]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
+        if o.get('STEERING_PROFILE'):
+            expected = {'name': 'glm-5.3', 'revision': o.get('STEERING_MODEL_REVISION'),
+                        'weight_set': o.get('STEERING_WEIGHT_SET') or ms.id,
+                        'tokenizer_revision': o.get('STEERING_TOKENIZER_REVISION'),
+                        'chat_template_sha256': o.get('STEERING_CHAT_TEMPLATE_SHA256'),
+                        'hidden_size': 6144, 'layer_count': 78}
+            try:
+                steering_release.validate_directory(o.get('STEERING_PROFILE'), expected)
+            except (OSError, steering_release.ProfileError) as e:
+                raise modelset.ModelError(f'--steering-profile {o.get("STEERING_PROFILE")}: {e}') from None
+        ms.drafter = drafter_of(o, ms, refresh, log)
         return ms, variant, ''
     except modelset.ModelError as e:
         return ms, variant, f'model: {e}'

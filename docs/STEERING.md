@@ -10,7 +10,9 @@ writer output:
 y' = y - request_scale * profile_alpha * r * (r^T y)
 ```
 
-`r` is a validated unit FP32 direction. `full` scope projects the combined shared and routed MLP output. `shared`
+`r` is a validated unit FP32 direction. This projects each writer's output, not the residual stream: a direction
+published for the post-layer residual (`h <- h - alpha * (h . d) d`) is a different operator, and needs converting
+before it is packed as a profile. `full` scope projects the combined shared and routed MLP output. `shared`
 scope projects the dense/shared MLP contribution; the routed experts do not enter its dot product. The projection is
 fused into launches that already consume or finalize those writer outputs. Row scales use the existing step-control
 transfer and profile vectors stay on the device after boot. Steering therefore adds no CUDA launch, copy, allocation,
@@ -39,11 +41,17 @@ For a local profile, the launcher's model-set id supplies `model.weight_set` unl
 tensor before readiness, copies the directions once, and includes the profile receipt in all-rank boot agreement. A
 mismatch in any rank stops the boot. [STEERING-PROFILE-SCHEMA.md](STEERING-PROFILE-SCHEMA.md) defines the files.
 
-An HF release may bundle profiles as deterministic safetensors artifacts under `steering/` and declare one default in
-`steering/index.json`. GR8 downloads and verifies that artifact with the rest of the release, materializes the runtime
-profile in the model cache, and fills all identity fields from its embedded manifest. The profile is then available to
-requests but remains off unless the request selects it (or the operator sets `--steering-force`). An explicit
-`--steering-profile DIR` always takes precedence. Gated repositories use the existing `HF_TOKEN` authentication.
+An HF release may bundle profiles as deterministic safetensors artifacts under `steering/`, listed in
+`steering/index.json`. GR8 loads one only when the operator asks for it: `--steering-profile hf:default` takes the
+release's default profile, and `--steering-profile hf:NAME` a named one. GR8 then downloads and verifies the artifact
+with the rest of the release, materializes the runtime profile in the model cache, and fills the identity fields from
+its embedded manifest. Without `--steering-profile`, a release's `steering/` directory is ignored and nothing from it
+is downloaded. A loaded profile stays off for every request that does not select it, unless the operator sets
+`--steering-force`. Gated repositories use the existing `HF_TOKEN` authentication.
+
+A profile that cannot be loaded stops the boot before any engine starts, with the reason: a directory or file that
+does not exist, an `hf:` name the release does not list, a schema or tensor that fails validation, or identity fields
+that do not match the model.
 
 Create or inspect the single-file artifact without NumPy or PyTorch:
 
@@ -64,7 +72,9 @@ Both completion endpoints accept two optional vendor fields:
 {"steering_profile":"example","steering_scale":1.0}
 ```
 
-Omitting both turns steering off. A profile without a scale uses `1.0`. A scale without a profile is accepted only
+Omitting both turns steering off. A request that names a profile on a server started without one is refused with
+400, `steering is not enabled on this server (start it with --steering-profile)`. A profile without a scale uses
+`1.0`. A scale without a profile is accepted only
 when it is zero, which canonicalizes to off. Values must be finite and in `[0, 4]`; the profile name must equal the
 one loaded at boot. Scale is converted to FP32 once at the API boundary, and its exact canonical bits become part of
 the request and prefix identity.
@@ -75,19 +85,9 @@ the request and prefix identity.
 traces. Profile extraction stays with the project that publishes the profile. See
 [tools/steering/README.md](../tools/steering/README.md).
 
-## Profile provenance and licensing
+## Profiles and licensing
 
-The `ablit-behavior-v1` profile used to qualify this implementation was independently extracted from weight
-differences between `zai-org/GLM-5.3-BF16` and
-`drowzeys/keys-GLM-5.3-EXL3-Abliterated`. The latter credits its de-risk projections to Blackfrost Research's
-`GLM-5.3-DERISKED-BF16`. The profile is a separately licensed model derivative and is not part of this repository.
-
-A distribution that places this profile in a model repository under `steering/` should put the following text in an
-adjacent `NOTICE` file and include the complete GLM-5.3 license:
-
-> This steering profile was independently extracted from weight differences between `zai-org/GLM-5.3-BF16` and
-> `drowzeys/keys-GLM-5.3-EXL3-Abliterated`, whose de-risk projections are credited to Blackfrost Research. Distributed
-> subject to the GLM-5.3 License.
-
-The g6 engine and extraction tools remain under this repository's MIT license. Other steering profiles must record
-their own source artifacts and applicable license rather than inheriting the engine license.
+GR8 ships no steering profile and loads none unless the operator names one. Operators may load profiles of their own
+choice. A profile is a derivative of the model it was extracted from: its manifest should record its source artifacts,
+and its distribution should carry the license and notices those sources require. The engine and the tools in
+`tools/steering/` remain under this repository's MIT license, which a profile does not inherit.

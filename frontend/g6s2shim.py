@@ -159,7 +159,9 @@ def _steering_header(f: dict, capability: dict | None):
         if capability and capability.get('forced'):
             return None, 'request steering conflicts with forced mode'
         return '', None
-    if not capability or profile != capability.get('profile'):
+    if not capability or not capability.get('profile'):
+        return None, 'steering is not enabled on this server (start it with --steering-profile)'
+    if profile != capability.get('profile'):
         return None, 'unknown steering_profile'
     if capability.get('forced') and scale != capability.get('forced_scale'):
         return None, 'request steering conflicts with forced mode'
