@@ -111,4 +111,7 @@ with tempfile.TemporaryDirectory(prefix='gr8-relay-loop-') as d:
     cpp.write_text(preamble + ctx + loop + main)
     subprocess.run(['g++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-pthread',
                     '-I', str(repo / 'engine/comms'), str(cpp), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    try:
+        subprocess.run([str(exe)], check=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise SystemExit('relay_loop_test: no progress to completion within 5 seconds') from None
