@@ -48,7 +48,7 @@ static void credits(uint64_t ring, uint32_t max_len, int msgs, unsigned seed) {
 // coalesced credit post followed by a 32-entry CQ poll: it must stop at the SQ bound, keep draining receives, reap the
 // two signaled credit batches, and then publish the newest `done` without ever attempting post 65.
 static void credit_backpressure() {
-  RelayCreditQueue q; q.capacity = 64;
+  RelayCreditQueue q; q.capacity = kRelayCredit;
   std::deque<bool> cq(4096, false);                         // false: receive, true: credit-send completion
   uint64_t done = 0, sent = 0;
   int posts = 0, blocked = 0, completions = 0;
@@ -76,7 +76,7 @@ static void credit_backpressure() {
     }
   }
   CHECK(blocked > 0);
-  CHECK(posts > 64 && posts < 4096);                        // pending positions were coalesced
+  CHECK(posts > (int)kRelayCredit && posts < 4096);                        // pending positions were coalesced
   CHECK(completions >= 2);
   CHECK(sent == 4096);
 }

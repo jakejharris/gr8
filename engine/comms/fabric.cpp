@@ -18,8 +18,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -146,7 +146,7 @@ struct RelayCtx {
   uint64_t done = 0, sent = 0;                            // ring position forwarded, and the last credit written
   int unsig = 0, inflight = 0; std::deque<int> batches;
   RelayCreditQueue credits; unsigned credit_sq_capacity = 0;
-  std::string ri_dev; unsigned ri_port = 1;
+  std::string ri_dev;
 };
 std::mutex g_relay_mu;
 RelayCtx* g_relay[32]; std::atomic<int> g_nrelay{0};
@@ -174,10 +174,12 @@ void relay_loop(int cpu) {
   auto credit_fail = [](RelayCtx& c, int rc, int saved_errno, const ibv_send_wr* bad, const ibv_send_wr* wr) {
     ibv_qp_attr at{}; ibv_qp_init_attr ia{};
     const int qrc = ibv_query_qp(c.ri, &at, IBV_QP_STATE, &ia);
-    fprintf(stderr, "[fabric r%d] relay credit post (-): rc=%d (%s) errno=%d (%s) dev=%s port=%u "
+    const std::string rc_msg = strerror(rc);                  // strerror has one buffer: copy before the second call
+    const std::string errno_msg = strerror(saved_errno);
+    fprintf(stderr, "[fabric r%d] relay credit post (-): rc=%d (%s) errno=%d (%s) dev=%s "
                     "qpn=%u state=%d query_rc=%d sq_capacity=%u sq_limit=%u credits_in_flight=%u "
                     "credit_batches=%zu credit_unsignaled=%u done=%llu sent=%llu bad_wr=%d\n",
-            c.rank, rc, strerror(rc), saved_errno, strerror(saved_errno), c.ri_dev.c_str(), c.ri_port,
+            c.rank, rc, rc_msg.c_str(), saved_errno, errno_msg.c_str(), c.ri_dev.c_str(),
             c.ri->qp_num, qrc ? -1 : (int)at.qp_state, qrc, c.credit_sq_capacity, c.credits.capacity,
             c.credits.in_flight, c.credits.batches.size(), c.credits.unsignaled,
             (unsigned long long)c.done, (unsigned long long)c.sent, bad == wr);
@@ -455,13 +457,14 @@ void Fabric::init(const FabricConfig& cfg) {
       CUCHECK(cudaHostAlloc((void**)&X.rbuf, (size_t)kRelayRecv * kRelayBuf, cudaHostAllocPortable));
       ibv_mr* rmr = ibv_reg_mr(I.rails[3].pd, X.rbuf, (size_t)kRelayRecv * kRelayBuf, IBV_ACCESS_LOCAL_WRITE); FCHECK(rmr);
       X.rbuf_lkey = rmr->lkey;
-      X.ri_cq = ibv_create_cq(I.rails[3].ctx, kRelayRecv + 64, nullptr, nullptr, 0); FCHECK(X.ri_cq);
+      X.ri_cq = ibv_create_cq(I.rails[3].ctx, kRelayRecv + (int)kRelayCredit, nullptr, nullptr, 0); FCHECK(X.ri_cq);
       X.fwd_cq = ibv_create_cq(I.rails[2].ctx, 4096, nullptr, nullptr, 0); FCHECK(X.fwd_cq);
       qor = mkqp(I.rails[2], nullptr, 4096, 1, 2, 128, nullptr);
       ibv_qp_cap credit_cap{};
-      qri = mkqp(I.rails[3], X.ri_cq, 64, kRelayRecv, 1, 64, &credit_cap); // its sends are credits to the origin
+      qri = mkqp(I.rails[3], X.ri_cq, (int)kRelayCredit, kRelayRecv, 1, 64, &credit_cap); // its sends are the credits
       X.credit_sq_capacity = credit_cap.max_send_wr;
-      X.credits.capacity = std::min<unsigned>(64, X.credit_sq_capacity); // keep the CQ reservation and old queue bound
+      // A provider may grant more than it was asked for, but the CQ only reserves kRelayCredit beyond the receives.
+      X.credits.capacity = std::min<unsigned>(kRelayCredit, X.credit_sq_capacity);
       FCHECK(X.credits.capacity > 0);
       { ibv_qp_init_attr ia{}; ia.send_cq = X.fwd_cq; ia.recv_cq = X.fwd_cq; ia.qp_type = IBV_QPT_RC;
         ia.cap.max_send_wr = 2048; ia.cap.max_recv_wr = 1; ia.cap.max_send_sge = 1; ia.cap.max_recv_sge = 1; ia.cap.max_inline_data = 64;

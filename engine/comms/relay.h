@@ -9,6 +9,7 @@ namespace g6 {
 
 constexpr uint64_t kRelayRing = 32ull << 20;   // relay ring bytes per ring Fabric (at most the region's receive side)
 constexpr uint32_t kRelayChunk = 1u << 20;     // a longer write crosses the relay in chunks of this size, in order
+constexpr unsigned kRelayCredit = 64;          // credit writes the relay-in send queue holds, and what its CQ reserves
 constexpr unsigned kRelayCreditSignal = 32;    // one credit CQE retires this batch of ordered writes
 
 inline uint64_t relay_pad(uint64_t len) { return (len + 63) & ~63ull; }

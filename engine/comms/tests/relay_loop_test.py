@@ -51,13 +51,13 @@ int credit_outstanding=0, credit_posts=0, credit_reaped=0, max_credit_outstandin
 int forward_drain_reaped=0; bool post_failed=false; unsigned error=0;
 int ibv_poll_cq(ibv_cq* cq, int max, ibv_wc* out) {
     if (post_failed) throw std::runtime_error("credit post reached a full SQ");
-    if (cq->credit && credit_posts >= 65 && credit_outstanding == 1 && cq->q.empty())
+    if (cq->credit && credit_posts > (int)kRelayCredit && credit_outstanding == 1 && cq->q.empty())
         throw std::runtime_error("expected success");
     if (!cq->credit && max > 1) return 0; // force forward completions through the queue-full drain
     int n=0;
     while (n<max && !cq->q.empty()) {
         out[n]=cq->q.front(); cq->q.pop_front();
-        if (cq->credit && out[n].opcode != IBV_WC_RECV) { credit_outstanding-=32; ++credit_reaped; }
+        if (cq->credit && out[n].opcode != IBV_WC_RECV) { credit_outstanding-=(int)kRelayCreditSignal; ++credit_reaped; }
         if (!cq->credit) ++forward_drain_reaped;
         ++n;
     }
@@ -66,7 +66,7 @@ int ibv_poll_cq(ibv_cq* cq, int max, ibv_wc* out) {
 int ibv_post_send(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr**) {
     if (qp->credit) {
         ++credit_posts;
-        if (credit_outstanding==64) { post_failed=true; errno=ENOMEM; return ENOMEM; }
+        if (credit_outstanding==(int)kRelayCredit) { post_failed=true; errno=ENOMEM; return ENOMEM; }
         ++credit_outstanding;
         if (credit_outstanding > max_credit_outstanding) max_credit_outstanding=credit_outstanding;
     }
@@ -88,14 +88,17 @@ int main() {
     }
     RelayCtx c; c.ri=&ri; c.ri_cq=&incoming; c.fwd=&fwd; c.fwd_cq=&forward;
     c.rbuf=recv.data(); c.ring=ring.data(); c.err=&error; c.rank=1;
-    c.credits.capacity=c.credit_sq_capacity=64; c.ri_dev="mock0";
+    c.credits.capacity=c.credit_sq_capacity=kRelayCredit; c.ri_dev="mock0";
     g_relay[0]=&c; g_nrelay=1;
     try { relay_loop(-1); }
     catch (const std::runtime_error& e) {
         if (strcmp(e.what(),"expected success")) { fprintf(stderr,"relay_loop_test: %s\n",e.what()); return 1; }
-        if (error || post_failed || credit_posts != 65 || credit_reaped != 2 || max_credit_outstanding != 64 ||
+        if (error || post_failed || credit_posts != (int)kRelayCredit+1 ||
+                credit_reaped != (int)(kRelayCredit/kRelayCreditSignal) ||
+                max_credit_outstanding != (int)kRelayCredit ||
                 forward_drain_reaped == 0 || c.sent != c.done) return 1;
-        printf("relay_loop_test: OK (65 posts, max 64 in flight, %d forward-drain completions)\n", forward_drain_reaped);
+        printf("relay_loop_test: OK (%u posts, max %u in flight, %d forward-drain completions)\n",
+               kRelayCredit+1, kRelayCredit, forward_drain_reaped);
         return 0;
     }
     return 1;
