@@ -1,13 +1,38 @@
 # Changelog
 
+## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
+
+- #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and
+  always the lowest request id, and a cancel is anchored at `boundary + LOOKAHEAD` with `LOOKAHEAD = 8` (`s2/service.h`).
+  Eight boundaries is fine slack for decode rounds of tens of milliseconds; during a prefill it is up to eight 8,192-row
+  quanta, about 50 s. Nothing printed the boundary a notice was anchored to, so a run could show the delay but not say
+  which mechanism produced it — and the two disagree only when a prompt outruns the lookahead.
+- `G6_S2_EVENTLOG=1` prints three lines to stderr on a serving build, with no state, no digest and no behaviour change:
+  `notice` (rank 0's control thread: the boundary it read and the future boundary it chose, i.e. `A` and `A + 8`),
+  `commit` (every rank: the boundary the notice landed at, so a rank that never prints it failed the epoch) and `step`
+  (every rank: one line per prefill quantum and prompt tail — request, row range, boundary — and not per decode round,
+  which would be far too much). Off by default.
+- `docs/EVENT-LATENCY.md` is the run: a long prompt whose client aborts 1.5 ms after admission (the shim already turns
+  the disconnect into the CANCEL), then a short follow-up, at 16K/32K/64K and `SESS` 2 and 4. 64K is the discriminator,
+  because 8 prefill quanta plus the tail outrun the 8-boundary lookahead. If the notice lands before the long request's
+  last prefill boundary the lookahead binds and the event-latency work is needed; if it lands after, the scheduler's
+  admission was the whole story.
+
 ## 2026-10-14: the prefill quantum goes to the shortest prompt, not the lowest request id
 
-- A client that disconnected 1.5 ms into a 31,984-token prompt left the slot occupied for 23.8 s, and a short follow-up
-  admitted behind it saw the same 23.8 s TTFT (#61). The prompt is below R, so this is the ordinary shared path, not the
-  exclusive one: `Scheduler::next()` took at most one prefilling session per quantum and always the **lowest request
-  id**, so a short request admitted behind a long prefill waited out every one of its quanta. At `--prefill 4096
-  --pf-lanes 2` a quantum is 8,192 rows, about 6 s on the reported cluster, and that prompt is four of them (8,192 x 3
-  plus 7,407) and then its one-row prompt tail: five boundaries behind one request.
+- `Scheduler::next()` took at most one prefilling session per quantum and always the lowest request id. Native ordinals
+  only increase, so the session that started prefilling first held every quantum until its prompt was done, whatever
+  sizes were waiting: a 900-token prompt sharing the engine with a 32K one got no step until the 32K prompt finished.
+  Found while reading #61.
+- It does not change #61's number, and the cluster run says why: the follow-up there is never admitted. An admit is an
+  event anchored at `boundary + LOOKAHEAD` with `LOOKAHEAD = 8` (`s2/service.h`), a quantum at `--prefill 4096
+  --pf-lanes 2` is 8,192 rows, and R is 65,536 — exactly 8 quanta. A below-R prompt therefore never occupies more than
+  8 prefill boundaries, so the admit lands at or after its last one, and above R the run is exclusive and the admit is
+  refused outright. Two sessions prefilling at once is unreachable from a client in that configuration, which is the one
+  #61 reports. Measured on four GB10s at TP=4, a short request submitted as a 31,990-token prompt is admitted: 23.5 s
+  against 22.6 s on `main`, i.e. unchanged. At `--prefill 2048 --pf-lanes 1`, where that prompt is 16 quanta and the
+  second admit lands mid-prefill, 14.2 s against 28.5 s, with the long prompt's own time unchanged. #61's remaining
+  delay is the lookahead, counted in boundaries rather than time.
 - The prefill choice is now the session with the fewest prompt rows left, `req.id` breaking ties. A session passed over
   `PREFILL_DEFER_MAX` (3) times is owed a turn and outranks every session that is not; once owed it is passed over at
   most once more per competing prefilling session, so a stream of short requests cannot defer a long prefill without
@@ -19,6 +44,9 @@
   prefill under seven short ones is never passed over more than `PREFILL_DEFER_MAX + MAX_SESSIONS` quanta; a single
   session's quanta are unchanged (8192/8192/8192/7407/1 rows); and two schedulers driven by the same events choose the
   same sessions and agree on every digest over 300 boundaries.
+- A prefill can now be interrupted by another session's quantum and resumed, which no earlier build could reach. On the
+  cluster, at a 2,048-row quantum, the interrupted 32K prompt still answers from the row its quanta cover: incident
+  000948, item 13, shard 12, checksum 07887, all correct.
 
 ## 2026-10-13: a session past R takes its own pages from the shared pool
 
